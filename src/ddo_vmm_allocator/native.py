@@ -174,15 +174,16 @@ class NativeVmmLibrary:
         )
         if status != 0 or not handle.value:
             raise NativeVmmError(self._last_error())
-        return NativeVmmRegion(self, handle)
+        return NativeVmmRegion(self, handle, backing=backing)
 
 
 class NativeVmmRegion:
     """A mapped CUDA VMM region that must be closed explicitly."""
 
-    def __init__(self, owner: NativeVmmLibrary, handle: ctypes.c_void_p) -> None:
+    def __init__(self, owner: NativeVmmLibrary, handle: ctypes.c_void_p, *, backing: str = "device") -> None:
         self._owner = owner
         self._handle: ctypes.c_void_p | None = handle
+        self.backing = backing
         self._owner._library.ddo_vmm_pressure_register(handle)
 
     @property

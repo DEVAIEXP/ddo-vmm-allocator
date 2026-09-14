@@ -85,3 +85,28 @@ def test_guarded_materialization_uses_stream_safe_temporary() -> None:
         native.set_dxgi_budget_guard(device_ordinal=0)
         adapter.close()
         arena.close()
+
+
+@pytest.mark.vmm
+def test_host_backing_exposes_cuda_tensor_view() -> None:
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device unavailable")
+    library_path = _library_path()
+    if not library_path.exists():
+        pytest.skip(f"VMM library unavailable: {library_path}")
+
+    from ddo_vmm_allocator.native import load_native_vmm
+    from ddo_vmm_allocator.tensor_view import PersistentVmmTensorView
+
+    library = load_native_vmm(library_path)
+    region = library.create_region(2 * 2**20, backing="host")
+    try:
+        view = PersistentVmmTensorView.create(region)
+        assert view.tensor.device.type == "cuda"
+        assert view.tensor.data_ptr() == region.info.address
+        view.tensor[:16] = 7
+        torch.cuda.synchronize()
+        assert torch.equal(view.tensor[:16].cpu(), torch.full((16,), 7, dtype=torch.uint8))
+    finally:
+        region.close()
