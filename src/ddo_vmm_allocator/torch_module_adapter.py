@@ -168,6 +168,14 @@ class VmmModuleAdapter:
             def before(_module: Any, _args: tuple[Any, ...], bindings=bindings) -> None:
                 self.arena.collect_completed_events()
                 try:
+                    # Start this block's upload and the next block's upload on
+                    # the copy stream before waiting for the current block.
+                    for binding in bindings:
+                        self.arena.prefetch_loaded_tensor(binding.group_name, copy_stream)
+                    next_index = block_index + 1
+                    if next_index < len(block_entries):
+                        for next_binding in block_entries[next_index]:
+                            self.arena.prefetch_loaded_tensor(next_binding.group_name, copy_stream)
                     for binding in bindings:
                         loaded = (
                             self.arena.wait_for_prefetch(binding.group_name)
@@ -188,13 +196,6 @@ class VmmModuleAdapter:
             def after(_module: Any, _args: tuple[Any, ...], _output: Any, bindings=bindings) -> Any:
                 for binding in bindings:
                     self.arena.release_after_current_stream(binding.group_name)
-                next_index = block_index + 1
-                if next_index < len(block_entries):
-                    for next_binding in block_entries[next_index]:
-                        try:
-                            self.arena.prefetch_loaded_tensor(next_binding.group_name, copy_stream)
-                        except WeightArenaError:
-                            break
                 return _output
 
             self._handles.append(block.register_forward_pre_hook(before))
