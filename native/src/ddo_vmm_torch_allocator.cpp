@@ -6,6 +6,7 @@
 
 #include "ddo_vmm.h"
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -30,7 +31,7 @@ struct AllocationRecord {
     };
     size_t mapped_size = 0;
     int device_ordinal = -1;
-    cudaEvent_t completion_event = nullptr;
+    CUevent completion_event = nullptr;
 
     AllocationRecord() = default;
     AllocationRecord(const AllocationRecord&) = delete;
@@ -64,8 +65,8 @@ struct AllocationRecord {
         if (completion_event != nullptr) {
             // A pointer may still be referenced by work on its freeing stream.
             // Never unmap its VMM backing before that work has completed.
-            cudaEventSynchronize(completion_event);
-            cudaEventDestroy(completion_event);
+            cuEventSynchronize(completion_event);
+            cuEventDestroy(completion_event);
             completion_event = nullptr;
         }
         region.reset();
@@ -123,28 +124,28 @@ void record_stream_completion(AllocationRecord* record, cudaStream_t stream) {
     if (record == nullptr || record->completion_event != nullptr) {
         return;
     }
-    cudaEvent_t event = nullptr;
+    CUevent event = nullptr;
     if (
-        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess
-        && cudaEventRecord(event, stream) == cudaSuccess
+        cuEventCreate(&event, CU_EVENT_DISABLE_TIMING) == CUDA_SUCCESS
+        && cuEventRecord(event, reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS
     ) {
         record->completion_event = event;
         return;
     }
     if (event != nullptr) {
-        cudaEventDestroy(event);
+        cuEventDestroy(event);
     }
     // If event setup failed, synchronize the freeing stream rather than
     // risk releasing a virtual mapping that a queued kernel can still read.
-    cudaStreamSynchronize(stream);
+    cuStreamSynchronize(reinterpret_cast<CUstream>(stream));
 }
 
 void wait_for_stream_completion(AllocationRecord* record) {
     if (record == nullptr || record->completion_event == nullptr) {
         return;
     }
-    cudaEventSynchronize(record->completion_event);
-    cudaEventDestroy(record->completion_event);
+    cuEventSynchronize(record->completion_event);
+    cuEventDestroy(record->completion_event);
     record->completion_event = nullptr;
 }
 

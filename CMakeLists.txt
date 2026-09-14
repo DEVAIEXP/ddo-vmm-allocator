@@ -17,7 +17,7 @@ target_include_directories(ddo_vmm
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/native/include>
 )
-target_link_libraries(ddo_vmm PRIVATE CUDA::cuda_driver CUDA::cudart)
+target_link_libraries(ddo_vmm PRIVATE CUDA::cuda_driver)
 
 if(MSVC)
     target_compile_options(ddo_vmm PRIVATE /W4 /permissive-)
