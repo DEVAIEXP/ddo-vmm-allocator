@@ -97,6 +97,24 @@ The cache is exact-process state.  On a new-allocation failure it is drained
 before one retry, so idle cached regions cannot turn a potential allocation
 into an immediate OOM.  Stream-aware reuse and model paging remain pending.
 
+## Weight-residency arena
+
+`VmmWeightArena` is the framework-neutral resident-weight policy layer: every group owns
+a stable virtual address, but only groups inside its configured resident budget
+hold physical VRAM backing.  It evicts only groups that the caller has unpinned.
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python .\scripts\vmm_weight_arena_probe.py `
+    --library .\build\Release\ddo_vmm.dll `
+    --group-megabytes 32 `
+    --resident-megabytes 64
+```
+
+The first arena probe is intentionally framework-free.  A caller must not
+unpin a group until all CUDA work using it has completed; the future tensor
+adapter will use CUDA events for asynchronous completion.
+
 ## Fresh-process runner launcher
 
 The launcher installs the same experimental allocator before importing the
