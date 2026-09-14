@@ -119,12 +119,11 @@ class VmmModuleAdapter:
         return [binding.group_name for binding in bindings]
 
     def attach_module_tree(self, root: Any, module_pattern: str) -> list[str]:
-        """Attach descendant parameters and hooks for matching transformer blocks.
+        """Attach matching blocks as packed VMM execution groups.
 
-        A block may contain nested attention/MLP linears, so ``recurse=False``
-        is not sufficient.  Parameters are still stored in separate VMM groups,
-        but the matching block's hook pins and releases all of them together.
-        Shared parameters are registered only once.
+        Each matching block gets one stable virtual region containing all of its
+        parameters. The parameter tensors are persistent typed subviews, so
+        pre/post hooks manage residency only once per execution block.
         """
         import torch
 
@@ -132,14 +131,14 @@ class VmmModuleAdapter:
             raise TypeError("root must be a torch.nn.Module")
         pattern = re.compile(module_pattern)
         attached_ids: set[int] = set()
-        block_count = 0
-        names: list[str] = []
-        block_entries: list[list[_Binding]] = []
+        group_names: list[str] = []
+        block_entries: list[str] = []
         copy_stream = torch.cuda.Stream()
         for block_name, block in root.named_modules():
             if not block_name or not pattern.search(block_name):
                 continue
-            bindings: list[_Binding] = []
+            entries: list[tuple[str, Any, str, Any]] = []
+            packed_sources: list[tuple[str, Any]] = []
             for relative_name, parameter in block.named_parameters(recurse=True):
                 if id(parameter) in attached_ids:
                     continue
@@ -149,63 +148,46 @@ class VmmModuleAdapter:
                     owner = getattr(owner, piece)
                 parameter_name = pieces[-1]
                 source = parameter.detach().to(device="cpu").contiguous()
-                group_name = f"{block_name}.{relative_name}"
-                if not self.arena.has_group(group_name):
-                    self.arena.reserve(group_name, source.numel() * source.element_size())
-                self.arena.bind_cpu_tensor(group_name, source)
-                stable = self.arena.persistent_tensor(group_name, dtype=source.dtype, shape=tuple(source.shape))
-                owner.register_parameter(parameter_name, torch.nn.Parameter(stable, requires_grad=False))
-                binding = _Binding(owner, parameter_name, group_name)
-                bindings.append(binding)
+                entries.append((relative_name, owner, parameter_name, source))
+                packed_sources.append((relative_name, source))
                 attached_ids.add(id(parameter))
-                names.append(group_name)
-            if not bindings:
+            if not entries:
                 continue
+            payload_bytes = sum(source.numel() * source.element_size() for _, source in packed_sources)
+            if not self.arena.has_group(block_name):
+                self.arena.reserve(block_name, payload_bytes)
+            stable_views = self.arena.bind_cpu_tensor_group(block_name, packed_sources)
+            for relative_name, owner, parameter_name, _source in entries:
+                owner.register_parameter(
+                    parameter_name,
+                    torch.nn.Parameter(stable_views[relative_name], requires_grad=False),
+                )
             block_index = len(block_entries)
-            block_entries.append(bindings)
-            block_count += 1
+            block_entries.append(block_name)
+            group_names.append(block_name)
 
-            def before(_module: Any, _args: tuple[Any, ...], bindings=bindings) -> None:
+            def before(_module: Any, _args: tuple[Any, ...], *, group_name=block_name, group_index=block_index) -> None:
                 self.arena.collect_completed_events()
                 try:
-                    # Start this block's upload and the next block's upload on
-                    # the copy stream before waiting for the current block.
-                    for binding in bindings:
-                        self.arena.prefetch_loaded_tensor(binding.group_name, copy_stream)
-                    next_index = block_index + 1
+                    self.arena.prefetch_loaded_group(group_name, copy_stream)
+                    next_index = group_index + 1
                     if next_index < len(block_entries):
-                        for next_binding in block_entries[next_index]:
-                            self.arena.prefetch_loaded_tensor(next_binding.group_name, copy_stream)
-                    for binding in bindings:
-                        loaded = (
-                            self.arena.wait_for_prefetch(binding.group_name)
-                            if getattr(self.arena._groups[binding.group_name], "upload_event", None) is not None
-                            else self.arena.pin_loaded_tensor(binding.group_name)
-                        )
-                        binding.module.register_parameter(
-                            binding.parameter_name, torch.nn.Parameter(loaded, requires_grad=False)
-                        )
+                        self.arena.prefetch_loaded_group(block_entries[next_index], copy_stream)
+                    self.arena.wait_for_prefetch_group(group_name)
                 except WeightArenaError:
                     self.arena.collect_completed_events(wait=True)
-                    for binding in bindings:
-                        loaded = self.arena.pin_loaded_tensor(binding.group_name)
-                        binding.module.register_parameter(
-                            binding.parameter_name, torch.nn.Parameter(loaded, requires_grad=False)
-                        )
+                    self.arena.pin_loaded_group(group_name)
 
-            def after(_module: Any, _args: tuple[Any, ...], _output: Any, bindings=bindings) -> Any:
-                for binding in bindings:
-                    self.arena.release_after_current_stream(binding.group_name)
+            def after(_module: Any, _args: tuple[Any, ...], _output: Any, *, group_name=block_name) -> Any:
+                self.arena.release_after_current_stream(group_name)
                 return _output
 
             self._handles.append(block.register_forward_pre_hook(before))
             self._handles.append(block.register_forward_hook(after))
-        if block_count == 0:
+        if not group_names:
             raise ValueError(f"no modules matched {module_pattern!r}")
-        self._bindings.extend(
-            _Binding(root, "", name) for name in names
-        )
-        return names
+        self._bindings.extend(_Binding(root, "", name) for name in group_names)
+        return group_names
 
     def close(self) -> None:
         for handle in self._handles:

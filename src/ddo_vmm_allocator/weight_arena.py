@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from .native import NativeVmmLibrary, NativeVmmRegion
@@ -41,7 +41,8 @@ class _WeightGroup:
     pending_events: list[Any] | None = None
     source_pinned: bool = False
     upload_event: Any | None = None
-
+    packed_sources: list[tuple[str, Any, int]] = field(default_factory=list)
+    packed_views: dict[str, Any] = field(default_factory=dict)
 
 class VmmWeightArena:
     """A bounded resident set of model-weight groups with stable virtual VA."""
@@ -67,8 +68,21 @@ class VmmWeightArena:
         self._pinned_source_bytes = 0
         self._groups: dict[str, _WeightGroup] = {}
         self._lru: OrderedDict[str, None] = OrderedDict()
+        self._file_slices: Any | None = None
+        self._staging_pool: Any | None = None
         self._closed = False
+    def configure_file_transport(self, file_slices: Any, staging_pool: Any) -> None:
+        """Configure optional checkpoint-slice transport for packed group uploads.
 
+        ``file_slices`` and ``staging_pool`` follow DDO's public-in-practice
+        transport protocol: lookup(source), begin_upload(), stage_file_slices(),
+        packed_bytes and mark_upload(event). Keeping the dependency duck-typed
+        lets this allocator remain usable without Diffusers or DDO installed.
+        """
+        if self._groups:
+            raise WeightArenaError("configure file transport before reserving weight groups")
+        self._file_slices = file_slices
+        self._staging_pool = staging_pool
     @property
     def resident_budget_bytes(self) -> int:
         return self._resident_budget_bytes
@@ -143,6 +157,124 @@ class VmmWeightArena:
             self._evict(group)
         return self.view(name)
 
+    def bind_cpu_tensor_group(self, name: str, sources: list[tuple[str, Any]]) -> dict[str, Any]:
+        """Bind several CPU tensors as one execution group's stable CUDA views.
+
+        A group owns one VMM mapping. Its parameter views are byte offsets into
+        that mapping, so materialization and eviction occur once per execution
+        block rather than once per individual parameter.
+        """
+        group = self._group(name)
+        if group.source_tensor is not None or group.packed_sources:
+            raise WeightArenaError(f"weight group already has bound sources: {name}")
+        if not sources:
+            raise ValueError("packed weight group requires at least one source")
+        try:
+            import torch
+
+            from .tensor_view import PersistentVmmTensorView
+        except ImportError as error:
+            raise WeightArenaError("binding tensor weights requires PyTorch and cuda-python") from error
+        normalized: list[tuple[str, Any, int]] = []
+        offset = 0
+        for weight_name, source in sources:
+            if not weight_name:
+                raise ValueError("packed weight name must be non-empty")
+            if not isinstance(source, torch.Tensor) or source.device.type != "cpu":
+                raise TypeError("packed VMM sources must be CPU torch tensors")
+            source = source.detach().contiguous()
+            size_bytes = source.numel() * source.element_size()
+            if self._pin_source and not source.is_pinned():
+                if self._pin_source_budget_bytes is None or self._pinned_source_bytes + size_bytes <= self._pin_source_budget_bytes:
+                    source = source.pin_memory()
+                    self._pinned_source_bytes += size_bytes
+            normalized.append((weight_name, source, offset))
+            offset += size_bytes
+        if offset > group.region.info.mapped_size:
+            raise WeightArenaError(f"packed CPU tensors do not fit in VMM group {name!r}")
+        self.materialize(name)
+        group.tensor_view = PersistentVmmTensorView.create(group.region)
+        group.packed_views = {}
+        for weight_name, source, offset in normalized:
+            byte_count = source.numel() * source.element_size()
+            group.packed_views[weight_name] = group.tensor_view.tensor.narrow(0, offset, byte_count).view(source.dtype).reshape(source.shape)
+        group.packed_sources = normalized
+        group.payload_loaded = False
+        if group.pin_count == 0:
+            self._evict(group)
+        return dict(group.packed_views)
+
+    def _upload_packed_group(self, group: _WeightGroup, stream: Any) -> None:
+        """Upload one packed execution group, preferring checkpoint slices."""
+        import torch
+
+        if group.payload_loaded:
+            return
+        if self._file_slices is not None and self._staging_pool is not None:
+            entries = [(source, self._file_slices.lookup(source)) for _, source, _ in group.packed_sources]
+            if entries and all(file_slice is not None for _, file_slice in entries):
+                self._staging_pool.begin_upload()
+                staged_bytes = self._staging_pool.stage_file_slices(entries)
+                expected_bytes = sum(source.numel() * source.element_size() for _, source, _ in group.packed_sources)
+                if staged_bytes != expected_bytes:
+                    raise WeightArenaError(f"checkpoint slice payload mismatch for VMM group {group.name!r}")
+                with torch.cuda.stream(stream):
+                    group.tensor_view.tensor.narrow(0, 0, staged_bytes).copy_(
+                        self._staging_pool.packed_bytes,
+                        non_blocking=True,
+                    )
+                    event = torch.cuda.Event(enable_timing=False)
+                    event.record(stream)
+                self._staging_pool.mark_upload(event)
+                group.upload_event = event
+                group.payload_loaded = True
+                return
+        with torch.cuda.stream(stream):
+            for _weight_name, source, offset in group.packed_sources:
+                byte_count = source.numel() * source.element_size()
+                destination = group.tensor_view.tensor.narrow(0, offset, byte_count).view(source.dtype).reshape(source.shape)
+                destination.copy_(source, non_blocking=source.is_pinned())
+            event = torch.cuda.Event(enable_timing=False)
+            event.record(stream)
+        group.upload_event = event
+        group.payload_loaded = True
+
+    def pin_loaded_group(self, name: str) -> dict[str, Any]:
+        """Materialize and populate a complete execution group on the current stream."""
+        group = self._group(name)
+        if not group.packed_sources or group.tensor_view is None:
+            raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
+        self.pin(name)
+        if not group.payload_loaded:
+            import torch
+
+            self._upload_packed_group(group, torch.cuda.current_stream(self._device_ordinal))
+        if group.upload_event is not None:
+            import torch
+
+            torch.cuda.current_stream(self._device_ordinal).wait_event(group.upload_event)
+            group.upload_event = None
+        return dict(group.packed_views)
+
+    def prefetch_loaded_group(self, name: str, stream: Any) -> None:
+        """Enqueue a whole execution group's upload on a copy stream."""
+        group = self._group(name)
+        if not group.packed_sources or group.tensor_view is None:
+            raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
+        if group.payload_loaded:
+            return
+        self.pin(name)
+        self._upload_packed_group(group, stream)
+    def wait_for_prefetch_group(self, name: str) -> dict[str, Any]:
+        group = self._group(name)
+        if group.upload_event is not None:
+            import torch
+
+            torch.cuda.current_stream(self._device_ordinal).wait_event(group.upload_event)
+            group.upload_event = None
+        if not group.packed_sources:
+            raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
+        return dict(group.packed_views)
     def pin_loaded_tensor(self, name: str) -> Any:
         """Materialize, pin, and populate a bound CUDA tensor on the current stream."""
 

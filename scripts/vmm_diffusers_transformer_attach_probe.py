@@ -53,7 +53,7 @@ def main() -> None:
     if args.materialize:
         started = time.perf_counter()
         for group_name in attached:
-            arena.pin_loaded_tensor(group_name)
+            arena.pin_loaded_group(group_name)
             torch.cuda.synchronize()
             arena.release_after_current_stream(group_name)
             arena.collect_completed_events(wait=True)
@@ -61,7 +61,7 @@ def main() -> None:
     print("Diffusers transformer VMM attach probe: PASS")
     print(f"  model: {args.model_path}")
     print(f"  matched modules: {len(matches)}")
-    print(f"  attached weight groups: {len(attached)}")
+    print(f"  attached execution groups: {len(attached)}")
     print(f"  resident budget: {args.resident_budget_gb:.2f} GiB")
     if args.materialize:
         print(f"  materialize/release: {materialize_seconds:.3f}s")
