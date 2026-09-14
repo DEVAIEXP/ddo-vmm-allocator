@@ -58,3 +58,14 @@ If CMake selects a single-config generator such as Ninja, the probe path is inst
 ```
 
 The probe writes a known byte pattern through the mapped virtual address.  It is intentionally small and independent of PyTorch.
+
+## Python bridge probe
+
+With the host Python environment, call the DLL through the explicit opaque-handle API:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m ddo_vmm_allocator.native --library .\build\Release\ddo_vmm.dll --megabytes 64
+```
+
+The bridge owns the VMM region with a context manager and deliberately does not expose the raw virtual address as a PyTorch tensor yet.
