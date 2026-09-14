@@ -39,6 +39,7 @@ class _WeightGroup:
     tensor_view: Any | None = None
     payload_loaded: bool = False
     pending_events: list[Any] | None = None
+    source_pinned: bool = False
 
 
 class VmmWeightArena:
@@ -52,6 +53,7 @@ class VmmWeightArena:
         device_ordinal: int = 0,
         backing: str = "device",
         pin_source: bool = False,
+        pin_source_budget_bytes: int | None = None,
     ) -> None:
         if resident_budget_bytes <= 0:
             raise ValueError("resident_budget_bytes must be positive")
@@ -60,6 +62,8 @@ class VmmWeightArena:
         self._device_ordinal = device_ordinal
         self._backing = backing
         self._pin_source = pin_source
+        self._pin_source_budget_bytes = pin_source_budget_bytes
+        self._pinned_source_bytes = 0
         self._groups: dict[str, _WeightGroup] = {}
         self._lru: OrderedDict[str, None] = OrderedDict()
         self._closed = False
@@ -115,14 +119,24 @@ class VmmWeightArena:
         if source_tensor.device.type != "cpu":
             raise ValueError("source_tensor must remain CPU-backed for explicit VMM transport")
         source_tensor = source_tensor.detach().contiguous()
-        if self._pin_source and source_tensor.device.type == "cpu" and not source_tensor.is_pinned():
+        source_bytes = source_tensor.numel() * source_tensor.element_size()
+        can_pin = self._pin_source and (
+            self._pin_source_budget_bytes is None
+            or self._pinned_source_bytes + source_bytes <= self._pin_source_budget_bytes
+        )
+        source_pinned = False
+        if can_pin and source_tensor.device.type == "cpu" and not source_tensor.is_pinned():
             source_tensor = source_tensor.pin_memory()
+            source_pinned = True
         if source_tensor.numel() * source_tensor.element_size() > group.region.info.mapped_size:
             raise WeightArenaError(f"CPU tensor does not fit in VMM group {name!r}")
 
         self.materialize(name)
         group.tensor_view = PersistentVmmTensorView.create(group.region)
         group.source_tensor = source_tensor
+        group.source_pinned = source_pinned or source_tensor.is_pinned()
+        if group.source_pinned:
+            self._pinned_source_bytes += source_bytes
         group.payload_loaded = False
         if group.pin_count == 0:
             self._evict(group)
@@ -139,7 +153,7 @@ class VmmWeightArena:
             source = group.source_tensor
             payload_bytes = source.numel() * source.element_size()
             destination = group.tensor_view.tensor.narrow(0, 0, payload_bytes).view(source.dtype).reshape(source.shape)
-            destination.copy_(source, non_blocking=self._pin_source)
+            destination.copy_(source, non_blocking=group.source_pinned)
             group.payload_loaded = True
         return group.tensor_view.tensor.narrow(0, 0, group.source_tensor.numel() * group.source_tensor.element_size()).view(
             group.source_tensor.dtype
