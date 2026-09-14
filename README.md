@@ -160,6 +160,16 @@ python .\scripts\vmm_module_tree_probe.py `
     --dimension 256
 ```
 
+The first real-model attach check is deliberately forward-free:
+
+```powershell
+python .\scripts\vmm_diffusers_transformer_attach_probe.py `
+    --model-path elismasilva/ltx2.3-image-distilled-1.1 `
+    --library .\build\Release\ddo_vmm.dll `
+    --pattern 'transformer_blocks\.0$' `
+    --resident-budget-gb 1
+```
+
 ## Tensor weight arena probe
 
 The tensor-aware arena binds CPU weights, reloads them whenever their VMM group
