@@ -84,6 +84,8 @@ class VmmWeightArena:
             "managed_uploads": 0,
             "managed_upload_bytes": 0,
             "evictions": 0,
+            "temporary_groups": 0,
+            "temporary_bytes": 0,
         }
         self._closed = False
 
@@ -356,6 +358,28 @@ class VmmWeightArena:
             torch.cuda.current_stream(self._device_ordinal).wait_event(group.upload_event)
             group.upload_event = None
         return dict(group.packed_views)
+
+    def temporary_loaded_group(self, name: str) -> dict[str, Any]:
+        """Copy one group into ordinary CUDA storage when local VMM backing is full."""
+
+        group = self._group(name)
+        if not group.packed_sources:
+            raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
+        import torch
+
+        total_bytes = group.packed_payload_bytes
+        if total_bytes <= 0:
+            raise WeightArenaError(f"weight group has no payload geometry: {name}")
+        temporary = torch.empty(total_bytes, dtype=torch.uint8, device=f"cuda:{self._device_ordinal}")
+        views: dict[str, Any] = {}
+        for weight_name, source, offset in group.packed_sources:
+            byte_count = source.numel() * source.element_size()
+            destination = temporary.narrow(0, offset, byte_count).view(source.dtype).reshape(source.shape)
+            destination.copy_(source, non_blocking=source.is_pinned())
+            views[weight_name] = destination
+        self._runtime_stats["temporary_groups"] += 1
+        self._runtime_stats["temporary_bytes"] += total_bytes
+        return views
 
     def prefetch_loaded_group(self, name: str, stream: Any) -> None:
         """Enqueue a whole execution group's upload on a copy stream."""

@@ -186,7 +186,7 @@ bool query_windows_memory(int device_ordinal, ddo_vmm_windows_memory_info* out_i
 }
 #endif
 
-bool dxgi_budget_guard_allows_materialize(int device_ordinal) {
+bool dxgi_budget_guard_allows_materialize(int device_ordinal, size_t required_bytes, ddo_vmm_backing_kind backing_kind) {
     DxgiBudgetGuardConfig config{};
     {
         std::scoped_lock lock(dxgi_budget_guard_mutex);
@@ -211,13 +211,16 @@ bool dxgi_budget_guard_allows_materialize(int device_ordinal) {
     const auto retained_budget = [](uint64_t budget, uint64_t reserve) {
         return budget > reserve ? budget - reserve : 0;
     };
-    const bool local_safe = config.local_reserve_bytes == 0 || info.local_budget_bytes == 0
-        || info.local_usage_bytes <= retained_budget(info.local_budget_bytes, config.local_reserve_bytes);
-    const bool shared_safe = config.shared_reserve_bytes == 0 || info.nonlocal_budget_bytes == 0
-        || info.nonlocal_usage_bytes <= retained_budget(info.nonlocal_budget_bytes, config.shared_reserve_bytes);
+    const uint64_t required = static_cast<uint64_t>(required_bytes);
+    const uint64_t local_limit = retained_budget(info.local_budget_bytes, config.local_reserve_bytes);
+    const uint64_t shared_limit = retained_budget(info.nonlocal_budget_bytes, config.shared_reserve_bytes);
+    const bool local_safe = backing_kind != DDO_VMM_BACKING_DEVICE || info.local_budget_bytes == 0
+        || (info.local_usage_bytes <= local_limit && required <= local_limit - info.local_usage_bytes);
+    const bool shared_safe = backing_kind != DDO_VMM_BACKING_HOST || info.nonlocal_budget_bytes == 0
+        || (info.nonlocal_usage_bytes <= shared_limit && required <= shared_limit - info.nonlocal_usage_bytes);
     const bool system_safe = config.system_reserve_bytes == 0
-        || (info.available_physical_bytes >= config.system_reserve_bytes
-            && info.available_commit_bytes >= config.system_reserve_bytes);
+        || (info.available_physical_bytes >= config.system_reserve_bytes + required
+            && info.available_commit_bytes >= config.system_reserve_bytes + required);
     return local_safe && shared_safe && system_safe;
 #else
     (void)device_ordinal;
@@ -425,7 +428,9 @@ extern "C" ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region) {
     }
     CUmemGenericAllocationHandle allocation = 0;
     while (
-        !dxgi_budget_guard_allows_materialize(region->device_ordinal)
+        !dxgi_budget_guard_allows_materialize(
+            region->device_ordinal, region->mapped_size, region->backing_kind
+        )
         || cuMemCreate(&allocation, region->mapped_size, &properties, 0) != CUDA_SUCCESS
     ) {
         allocation = 0;

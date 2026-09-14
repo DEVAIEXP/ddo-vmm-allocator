@@ -162,12 +162,19 @@ class VmmModuleAdapter:
                     parameter_name,
                     torch.nn.Parameter(stable_views[relative_name], requires_grad=False),
                 )
+            stable_data = {
+                relative_name: owner._parameters[parameter_name].data
+                for relative_name, owner, parameter_name, _source in entries
+            }
+            temporary_views: dict[str, Any] | None = None
             block_index = len(block_entries)
             block_entries.append(block_name)
             group_names.append(block_name)
 
             def before(_module: Any, _args: tuple[Any, ...], *, group_name=block_name, group_index=block_index) -> None:
+                nonlocal temporary_views
                 self.arena.collect_completed_events()
+                temporary_views = None
                 try:
                     self.arena.prefetch_loaded_group(group_name, copy_stream)
                 except WeightArenaError:
@@ -175,7 +182,15 @@ class VmmModuleAdapter:
                     # kernel still pins the available budget, wait rather than
                     # allocating outside the arena's bound.
                     self.arena.collect_completed_events(wait=True)
-                    self.arena.pin_loaded_group(group_name)
+                    try:
+                        self.arena.pin_loaded_group(group_name)
+                    except WeightArenaError:
+                        # VMM local backing is full.  Keep the stable virtual
+                        # view intact and execute this block from one ordinary
+                        # CUDA temporary, then release it after the hook.
+                        temporary_views = self.arena.temporary_loaded_group(group_name)
+                        for relative_name, owner, parameter_name, _source in entries:
+                            owner._parameters[parameter_name].data = temporary_views[relative_name]
                 else:
                     next_index = group_index + 1
                     if next_index < len(block_entries):
@@ -188,7 +203,13 @@ class VmmModuleAdapter:
                     self.arena.wait_for_prefetch_group(group_name)
 
             def after(_module: Any, _args: tuple[Any, ...], _output: Any, *, group_name=block_name) -> Any:
-                self.arena.release_after_current_stream(group_name)
+                nonlocal temporary_views
+                if temporary_views is not None:
+                    for relative_name, owner, parameter_name, _source in entries:
+                        owner._parameters[parameter_name].data = stable_data[relative_name]
+                    temporary_views = None
+                else:
+                    self.arena.release_after_current_stream(group_name)
                 return _output
 
             self._handles.append(block.register_forward_pre_hook(before))
