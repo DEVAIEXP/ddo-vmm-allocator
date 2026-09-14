@@ -43,6 +43,7 @@ class _WeightGroup:
     upload_event: Any | None = None
     packed_sources: list[tuple[str, Any, int]] = field(default_factory=list)
     packed_views: dict[str, Any] = field(default_factory=dict)
+    packed_payload_bytes: int = 0
 
 class VmmWeightArena:
     """A bounded resident set of model-weight groups with stable virtual VA."""
@@ -70,6 +71,7 @@ class VmmWeightArena:
         self._lru: OrderedDict[str, None] = OrderedDict()
         self._file_slices: Any | None = None
         self._staging_pool: Any | None = None
+        self._managed_source: Any | None = None
         self._closed = False
     def configure_file_transport(self, file_slices: Any, staging_pool: Any) -> None:
         """Configure optional checkpoint-slice transport for packed group uploads.
@@ -83,6 +85,38 @@ class VmmWeightArena:
             raise WeightArenaError("configure file transport before reserving weight groups")
         self._file_slices = file_slices
         self._staging_pool = staging_pool
+    def configure_managed_source(self, managed_source: Any) -> None:
+        """Configure a persistent managed-memory source for packed groups.
+
+        The source object implements ``populate_group(name, weights)`` and
+        ``group_address(name)``. It stays separate from local VMM residency:
+        kernels still read local pages, while Windows can place the immutable
+        source model in its managed/shared budget.
+        """
+        self._managed_source = managed_source
+
+    def preload_managed_sources(self, names: list[str] | None = None) -> int:
+        """Populate managed sources incrementally and release duplicated CPU data."""
+        if self._managed_source is None:
+            raise WeightArenaError("no managed source is configured")
+        populated = 0
+        for name in names or list(self._groups):
+            group = self._group(name)
+            if not group.packed_sources:
+                continue
+            weights = [(weight_name, source) for weight_name, source, _ in group.packed_sources]
+            if not self._managed_source.populate_group(name, weights):
+                raise WeightArenaError(f"managed source budget cannot hold group {name!r}")
+            group.packed_payload_bytes = sum(source.numel() * source.element_size() for _, source in weights)
+            group.packed_sources.clear()
+            populated += 1
+        return populated
+    def packed_source_groups(self) -> list[tuple[str, list[tuple[str, Any]]]]:
+        """Return the immutable CPU source layout for each packed group."""
+        return [
+            (name, [(weight_name, source) for weight_name, source, _ in group.packed_sources])
+            for name, group in self._groups.items()
+        ]
     @property
     def resident_budget_bytes(self) -> int:
         return self._resident_budget_bytes
@@ -199,6 +233,7 @@ class VmmWeightArena:
             byte_count = source.numel() * source.element_size()
             group.packed_views[weight_name] = group.tensor_view.tensor.narrow(0, offset, byte_count).view(source.dtype).reshape(source.shape)
         group.packed_sources = normalized
+        group.packed_payload_bytes = offset
         group.payload_loaded = False
         if group.pin_count == 0:
             self._evict(group)
@@ -210,6 +245,31 @@ class VmmWeightArena:
 
         if group.payload_loaded:
             return
+        if self._managed_source is not None:
+            weights = [(weight_name, source) for weight_name, source, _ in group.packed_sources]
+            if self._managed_source.populate_group(group.name, weights):
+                try:
+                    from cuda.bindings import driver
+                except ImportError as error:
+                    raise WeightArenaError("managed source transfer requires cuda-python") from error
+                payload_bytes = group.packed_payload_bytes
+                if payload_bytes <= 0:
+                    raise WeightArenaError(f"managed source has no payload geometry for group {group.name!r}")
+                result = driver.cuMemcpyDtoDAsync(
+                    driver.CUdeviceptr(group.tensor_view.tensor.data_ptr()),
+                    driver.CUdeviceptr(self._managed_source.group_address(group.name)),
+                    payload_bytes,
+                    driver.CUstream(stream.cuda_stream),
+                )
+                if result[0] != driver.CUresult.CUDA_SUCCESS:
+                    raise WeightArenaError(f"managed source DMA failed for group {group.name!r}: {result[0]}")
+                import torch
+
+                event = torch.cuda.Event(enable_timing=False)
+                event.record(stream)
+                group.upload_event = event
+                group.payload_loaded = True
+                return
         if self._file_slices is not None and self._staging_pool is not None:
             entries = [(source, self._file_slices.lookup(source)) for _, source, _ in group.packed_sources]
             if entries and all(file_slice is not None for _, file_slice in entries):
