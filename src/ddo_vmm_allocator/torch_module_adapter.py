@@ -170,13 +170,22 @@ class VmmModuleAdapter:
                 self.arena.collect_completed_events()
                 try:
                     self.arena.prefetch_loaded_group(group_name, copy_stream)
-                    next_index = group_index + 1
-                    if next_index < len(block_entries):
-                        self.arena.prefetch_loaded_group(block_entries[next_index], copy_stream)
-                    self.arena.wait_for_prefetch_group(group_name)
                 except WeightArenaError:
+                    # The current group is mandatory.  If a previously launched
+                    # kernel still pins the available budget, wait rather than
+                    # allocating outside the arena's bound.
                     self.arena.collect_completed_events(wait=True)
                     self.arena.pin_loaded_group(group_name)
+                else:
+                    next_index = group_index + 1
+                    if next_index < len(block_entries):
+                        try:
+                            self.arena.prefetch_loaded_group(block_entries[next_index], copy_stream)
+                        except WeightArenaError:
+                            # Look-ahead is optional.  A sub-page resident
+                            # budget may fit one rounded block but not two.
+                            pass
+                    self.arena.wait_for_prefetch_group(group_name)
 
             def after(_module: Any, _args: tuple[Any, ...], _output: Any, *, group_name=block_name) -> Any:
                 self.arena.release_after_current_stream(group_name)
