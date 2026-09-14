@@ -51,6 +51,7 @@ class VmmWeightArena:
         resident_budget_bytes: int,
         device_ordinal: int = 0,
         backing: str = "device",
+        pin_source: bool = False,
     ) -> None:
         if resident_budget_bytes <= 0:
             raise ValueError("resident_budget_bytes must be positive")
@@ -58,6 +59,7 @@ class VmmWeightArena:
         self._resident_budget_bytes = resident_budget_bytes
         self._device_ordinal = device_ordinal
         self._backing = backing
+        self._pin_source = pin_source
         self._groups: dict[str, _WeightGroup] = {}
         self._lru: OrderedDict[str, None] = OrderedDict()
         self._closed = False
@@ -113,6 +115,8 @@ class VmmWeightArena:
         if source_tensor.device.type != "cpu":
             raise ValueError("source_tensor must remain CPU-backed for explicit VMM transport")
         source_tensor = source_tensor.detach().contiguous()
+        if self._pin_source and source_tensor.device.type == "cpu" and not source_tensor.is_pinned():
+            source_tensor = source_tensor.pin_memory()
         if source_tensor.numel() * source_tensor.element_size() > group.region.info.mapped_size:
             raise WeightArenaError(f"CPU tensor does not fit in VMM group {name!r}")
 
@@ -135,7 +139,7 @@ class VmmWeightArena:
             source = group.source_tensor
             payload_bytes = source.numel() * source.element_size()
             destination = group.tensor_view.tensor.narrow(0, 0, payload_bytes).view(source.dtype).reshape(source.shape)
-            destination.copy_(source, non_blocking=False)
+            destination.copy_(source, non_blocking=self._pin_source)
             group.payload_loaded = True
         return group.tensor_view.tensor.narrow(0, 0, group.source_tensor.numel() * group.source_tensor.element_size()).view(
             group.source_tensor.dtype
