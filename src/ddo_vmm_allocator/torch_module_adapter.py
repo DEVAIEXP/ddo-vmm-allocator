@@ -179,16 +179,26 @@ class VmmModuleAdapter:
                 relative_name: owner._parameters[parameter_name].data
                 for relative_name, owner, parameter_name, _source in entries
             }
-            temporary_views: dict[str, Any] | None = None
+            # Keep per-block hook state in an object captured as a default
+            # argument.  Loop-created closures must never share the temporary
+            # storage or parameter list of the last attached block.
+            hook_state: dict[str, Any] = {"temporary_views": None}
             block_index = len(block_entries)
             block_entries.append(block_name)
             group_names.append(block_name)
 
-            def before(_module: Any, _args: tuple[Any, ...], *, group_name=block_name, group_index=block_index) -> None:
-                nonlocal temporary_views
+            def before(
+                _module: Any,
+                _args: tuple[Any, ...],
+                *,
+                group_name=block_name,
+                group_index=block_index,
+                block_entries=entries,
+                block_state=hook_state,
+            ) -> None:
                 self._collect_temporary_lifetimes()
                 self.arena.collect_completed_events()
-                temporary_views = None
+                block_state["temporary_views"] = None
                 try:
                     self.arena.prefetch_loaded_group(group_name, copy_stream)
                 except (WeightArenaError, NativeVmmError):
@@ -203,7 +213,8 @@ class VmmModuleAdapter:
                         # view intact and execute this block from one ordinary
                         # CUDA temporary, then release it after the hook.
                         temporary_views = self.arena.temporary_loaded_group(group_name)
-                        for relative_name, owner, parameter_name, _source in entries:
+                        block_state["temporary_views"] = temporary_views
+                        for relative_name, owner, parameter_name, _source in block_entries:
                             owner._parameters[parameter_name].data = temporary_views[relative_name]
                 else:
                     next_index = group_index + 1
@@ -216,8 +227,17 @@ class VmmModuleAdapter:
                             pass
                     self.arena.wait_for_prefetch_group(group_name)
 
-            def after(_module: Any, _args: tuple[Any, ...], _output: Any, *, group_name=block_name) -> Any:
-                nonlocal temporary_views
+            def after(
+                _module: Any,
+                _args: tuple[Any, ...],
+                _output: Any,
+                *,
+                group_name=block_name,
+                block_entries=entries,
+                block_state=hook_state,
+                block_stable_data=stable_data,
+            ) -> Any:
+                temporary_views = block_state["temporary_views"]
                 if temporary_views is not None:
                     # A temporary tensor is not protected by the VMM arena.
                     # Synchronize before restoring the stable parameter view so
@@ -226,9 +246,9 @@ class VmmModuleAdapter:
                     event = torch.cuda.Event(enable_timing=False)
                     event.record(torch.cuda.current_stream(self.arena._device_ordinal))
                     self._temporary_lifetimes.append((event, temporary_views))
-                    for relative_name, owner, parameter_name, _source in entries:
-                        owner._parameters[parameter_name].data = stable_data[relative_name]
-                    temporary_views = None
+                    for relative_name, owner, parameter_name, _source in block_entries:
+                        owner._parameters[parameter_name].data = block_stable_data[relative_name]
+                    block_state["temporary_views"] = None
                 else:
                     self.arena.release_after_current_stream(group_name)
                 return _output

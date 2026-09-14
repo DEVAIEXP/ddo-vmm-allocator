@@ -228,6 +228,17 @@ bool dxgi_budget_guard_allows_materialize(int device_ordinal, size_t required_by
 #endif
 }
 
+bool dxgi_budget_guard_configured(int device_ordinal) {
+    std::scoped_lock lock(dxgi_budget_guard_mutex);
+    for (const auto& [ordinal, config] : dxgi_budget_guards) {
+        if (ordinal == device_ordinal) {
+            return config.local_reserve_bytes != 0 || config.shared_reserve_bytes != 0
+                || config.system_reserve_bytes != 0;
+        }
+    }
+    return false;
+}
+
 namespace {
 
 bool activate_region_context(const ddo_vmm_region* region, CUcontext* temporary_primary_context) {
@@ -427,13 +438,21 @@ extern "C" ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region) {
         return DDO_VMM_CUDA_ERROR;
     }
     CUmemGenericAllocationHandle allocation = 0;
-    while (
-        !dxgi_budget_guard_allows_materialize(
+    const bool guard_configured = dxgi_budget_guard_configured(region->device_ordinal);
+    if (!dxgi_budget_guard_allows_materialize(
             region->device_ordinal, region->mapped_size, region->backing_kind
-        )
-        || cuMemCreate(&allocation, region->mapped_size, &properties, 0) != CUDA_SUCCESS
-    ) {
+        )) {
+        set_error("dxgi_budget_guard", CUDA_ERROR_OUT_OF_MEMORY);
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    while (cuMemCreate(&allocation, region->mapped_size, &properties, 0) != CUDA_SUCCESS) {
         allocation = 0;
+        if (guard_configured) {
+            set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
+            release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+            return DDO_VMM_OUT_OF_MEMORY;
+        }
         if (!ddo_vmm_pressure_evict_one(region->device_ordinal)) {
             set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
             release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
