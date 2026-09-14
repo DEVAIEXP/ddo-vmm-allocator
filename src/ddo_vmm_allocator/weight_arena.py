@@ -151,7 +151,7 @@ class VmmWeightArena:
             group.pending_events = []
         group.pending_events.append(event)
 
-    def collect_completed_events(self) -> int:
+    def collect_completed_events(self, *, wait: bool = False) -> int:
         """Unpin groups whose previously-recorded CUDA events have completed."""
 
         released = 0
@@ -160,6 +160,8 @@ class VmmWeightArena:
                 continue
             pending = []
             for event in group.pending_events:
+                if wait and not event.query():
+                    event.synchronize()
                 if event.query():
                     self.unpin(group.name)
                     released += 1
@@ -167,6 +169,29 @@ class VmmWeightArena:
                     pending.append(event)
             group.pending_events = pending
         return released
+
+    def persistent_tensor(self, name: str, *, dtype: Any, shape: tuple[int, ...]) -> Any:
+        """Return a typed view over a bound group's stable CUDA address.
+
+        The returned tensor object remains valid across eviction/rematerialization,
+        but its bytes are only valid while the group is pinned and populated.
+        """
+        group = self._group(name)
+        if group.tensor_view is None or group.source_tensor is None:
+            raise WeightArenaError(f"weight group has no bound CPU tensor: {name}")
+        import torch
+
+        expected = 1
+        for dimension in shape:
+            expected *= dimension
+        if expected * torch.empty((), dtype=dtype).element_size() > group.region.info.mapped_size:
+            raise WeightArenaError(f"typed tensor does not fit in VMM group {name!r}")
+        self.materialize(name)
+        typed = group.tensor_view.tensor.narrow(0, 0, expected * torch.empty((), dtype=dtype).element_size())
+        typed = typed.view(dtype).reshape(shape)
+        if group.pin_count == 0:
+            self._evict(group)
+        return typed
 
     def view(self, name: str) -> WeightGroupView:
         group = self._group(name)

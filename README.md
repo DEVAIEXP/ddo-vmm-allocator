@@ -133,6 +133,25 @@ python .\scripts\vmm_persistent_tensor_probe.py `
 Data is intentionally discarded by eviction; model code must repopulate a
 weight group before submitting kernels that use its persistent tensor view.
 
+## PyTorch module adapter probe
+
+`VmmModuleAdapter` attaches a CPU-backed parameter to a module with explicit
+pre-forward population and post-forward CUDA-event release.  This is the first
+framework integration layer; it is not the global PyTorch allocator and does
+not depend on any GPL implementation:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python .\scripts\vmm_module_adapter_probe.py `
+    --library .\build\Release\ddo_vmm.dll `
+    --dimension 512
+```
+
+The probe uses two BF16 linear layers and a one-group resident budget.  The
+second layer forces a safe eviction/reload of the first layer while preserving
+the virtual tensor addresses.  Only after this probe passes should a model
+specific transformer adapter be added.
+
 ## Tensor weight arena probe
 
 The tensor-aware arena binds CPU weights, reloads them whenever their VMM group
