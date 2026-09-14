@@ -322,6 +322,12 @@ class VmmWeightArena:
         if not group.packed_sources or group.tensor_view is None:
             raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
         if group.payload_loaded:
+            # A previous forward may have released the group after its CUDA
+            # event completed.  Retain it again before this forward uses the
+            # stable view.  Do not increment an existing look-ahead pin: that
+            # pin already belongs to this forthcoming consumer.
+            if group.pin_count == 0:
+                self.pin(name)
             return
         self.pin(name)
         self._upload_packed_group(group, stream)
