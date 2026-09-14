@@ -1,0 +1,42 @@
+# DDO VMM Allocator
+
+An Apache-2.0 DDO CUDA Virtual Memory Management (VMM) allocator project for PyTorch model-weight paging.
+
+This repository is intentionally separate from `diffusers-dynamic-offloader`.  Its purpose is to provide a reusable, testable allocator runtime which DDO may later consume as an optional backend.
+
+## Goals
+
+- Stable CUDA virtual addresses for model-weight tensors.
+- Explicit physical backing, mapping, residency and eviction through the CUDA Driver VMM API.
+- A policy layer for demand loading that is independent of Diffusers and model architecture.
+- Windows and Linux support for the CUDA VMM core.
+- A future, small PyTorch allocator adapter isolated from the portable VMM core.
+
+## Non-goals
+
+- No code, names, layouts, constants or implementation details are taken from GPL projects.
+- No use of `cudaMallocManaged` as a weight-compute backend.
+- No promise that CUDA VMM alone changes PyTorch's own allocator behavior.  That requires the later native adapter.
+
+## Architecture
+
+```
+CUDA driver VMM                 portable Python policy
+cuMemAddressReserve        ->  virtual address arena
+cuMemCreate                ->  physical-page pool
+cuMemMap/cuMemSetAccess    ->  residency manager
+cuMemUnmap/cuMemRelease    ->  eviction manager
+
+future native PyTorch adapter -> allocator integration and WDDM interaction
+```
+
+The core API will be implemented through `cuda-python` (`cuda.bindings`), which is Apache-2.0.  The project will first validate the VMM lifecycle with isolated probes before exposing a PyTorch allocator integration.
+
+## Platform support
+
+The VMM lifecycle is designed for CUDA on Windows and Linux.  Both platforms support the CUDA Driver VMM API.  File transport and native allocator loading are platform-specific adapters; they must not leak into the core paging policy.
+
+## Development status
+
+Scaffold phase.  The present package defines the platform/capability boundary and does not yet install a PyTorch allocator.  That separation is deliberate: a Python-only package cannot safely replace PyTorch's native caching allocator.
+
