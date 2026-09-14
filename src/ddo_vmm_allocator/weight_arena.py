@@ -367,7 +367,10 @@ class VmmWeightArena:
             raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
         import torch
 
-        total_bytes = group.packed_payload_bytes
+        total_bytes = max(
+            offset + source.numel() * source.element_size()
+            for _weight_name, source, offset in group.packed_sources
+        )
         if total_bytes <= 0:
             raise WeightArenaError(f"weight group has no payload geometry: {name}")
         temporary = torch.empty(total_bytes, dtype=torch.uint8, device=f"cuda:{self._device_ordinal}")
