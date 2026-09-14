@@ -72,7 +72,36 @@ class VmmWeightArena:
         self._file_slices: Any | None = None
         self._staging_pool: Any | None = None
         self._managed_source: Any | None = None
+        self._runtime_stats: dict[str, int] = {
+            "materializations": 0,
+            "lost_residency": 0,
+            "uploads": 0,
+            "upload_bytes": 0,
+            "file_uploads": 0,
+            "file_upload_bytes": 0,
+            "cpu_uploads": 0,
+            "cpu_upload_bytes": 0,
+            "managed_uploads": 0,
+            "managed_upload_bytes": 0,
+            "evictions": 0,
+        }
         self._closed = False
+
+    def reset_runtime_stats(self) -> None:
+        """Reset counters after model attachment and before a measured denoise."""
+
+        for key in self._runtime_stats:
+            self._runtime_stats[key] = 0
+
+    def runtime_stats(self) -> dict[str, int]:
+        """Return transfer/residency counters for the current measured interval."""
+
+        result = dict(self._runtime_stats)
+        result["resident_bytes"] = self.resident_bytes
+        result["resident_groups"] = sum(
+            group.region.materialized for group in self._groups.values()
+        )
+        return result
     def configure_file_transport(self, file_slices: Any, staging_pool: Any) -> None:
         """Configure optional checkpoint-slice transport for packed group uploads.
 
@@ -269,6 +298,10 @@ class VmmWeightArena:
                 event.record(stream)
                 group.upload_event = event
                 group.payload_loaded = True
+                self._runtime_stats["uploads"] += 1
+                self._runtime_stats["upload_bytes"] += payload_bytes
+                self._runtime_stats["managed_uploads"] += 1
+                self._runtime_stats["managed_upload_bytes"] += payload_bytes
                 return
         if self._file_slices is not None and self._staging_pool is not None:
             entries = [(source, self._file_slices.lookup(source)) for _, source, _ in group.packed_sources]
@@ -288,6 +321,10 @@ class VmmWeightArena:
                 self._staging_pool.mark_upload(event)
                 group.upload_event = event
                 group.payload_loaded = True
+                self._runtime_stats["uploads"] += 1
+                self._runtime_stats["upload_bytes"] += staged_bytes
+                self._runtime_stats["file_uploads"] += 1
+                self._runtime_stats["file_upload_bytes"] += staged_bytes
                 return
         with torch.cuda.stream(stream):
             for _weight_name, source, offset in group.packed_sources:
@@ -298,6 +335,10 @@ class VmmWeightArena:
             event.record(stream)
         group.upload_event = event
         group.payload_loaded = True
+        self._runtime_stats["uploads"] += 1
+        self._runtime_stats["upload_bytes"] += group.packed_payload_bytes
+        self._runtime_stats["cpu_uploads"] += 1
+        self._runtime_stats["cpu_upload_bytes"] += group.packed_payload_bytes
 
     def pin_loaded_group(self, name: str) -> dict[str, Any]:
         """Materialize and populate a complete execution group on the current stream."""
@@ -472,6 +513,8 @@ class VmmWeightArena:
             # since its last Python-side use.  Its data must be uploaded again.
             group.payload_loaded = False
             group.upload_event = None
+            self._runtime_stats["materializations"] += 1
+            self._runtime_stats["lost_residency"] += 1
         self._make_room_for(group, protected_name=name)
         group.region.materialize()
         self._touch(name)
@@ -569,10 +612,10 @@ class VmmWeightArena:
         self._lru.move_to_end(name)
         self._groups[name].region.touch_pressure()
 
-    @staticmethod
-    def _evict(group: _WeightGroup) -> None:
+    def _evict(self, group: _WeightGroup) -> None:
         group.region.evict()
         group.payload_loaded = False
+        self._runtime_stats["evictions"] += 1
 
     def _group(self, name: str) -> _WeightGroup:
         self._require_open()
