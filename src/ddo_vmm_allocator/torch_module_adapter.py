@@ -134,6 +134,8 @@ class VmmModuleAdapter:
         attached_ids: set[int] = set()
         block_count = 0
         names: list[str] = []
+        block_entries: list[list[_Binding]] = []
+        copy_stream = torch.cuda.Stream()
         for block_name, block in root.named_modules():
             if not block_name or not pattern.search(block_name):
                 continue
@@ -159,13 +161,19 @@ class VmmModuleAdapter:
                 names.append(group_name)
             if not bindings:
                 continue
+            block_index = len(block_entries)
+            block_entries.append(bindings)
             block_count += 1
 
             def before(_module: Any, _args: tuple[Any, ...], bindings=bindings) -> None:
                 self.arena.collect_completed_events()
                 try:
                     for binding in bindings:
-                        loaded = self.arena.pin_loaded_tensor(binding.group_name)
+                        loaded = (
+                            self.arena.wait_for_prefetch(binding.group_name)
+                            if getattr(self.arena._groups[binding.group_name], "upload_event", None) is not None
+                            else self.arena.pin_loaded_tensor(binding.group_name)
+                        )
                         binding.module.register_parameter(
                             binding.parameter_name, torch.nn.Parameter(loaded, requires_grad=False)
                         )
@@ -180,6 +188,13 @@ class VmmModuleAdapter:
             def after(_module: Any, _args: tuple[Any, ...], _output: Any, bindings=bindings) -> Any:
                 for binding in bindings:
                     self.arena.release_after_current_stream(binding.group_name)
+                next_index = block_index + 1
+                if next_index < len(block_entries):
+                    for next_binding in block_entries[next_index]:
+                        try:
+                            self.arena.prefetch_loaded_tensor(next_binding.group_name, copy_stream)
+                        except WeightArenaError:
+                            break
                 return _output
 
             self._handles.append(block.register_forward_pre_hook(before))

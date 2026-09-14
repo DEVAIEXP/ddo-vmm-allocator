@@ -40,6 +40,7 @@ class _WeightGroup:
     payload_loaded: bool = False
     pending_events: list[Any] | None = None
     source_pinned: bool = False
+    upload_event: Any | None = None
 
 
 class VmmWeightArena:
@@ -149,6 +150,9 @@ class VmmWeightArena:
         if group.source_tensor is None or group.tensor_view is None:
             raise WeightArenaError(f"weight group has no bound CPU tensor: {name}")
         self.pin(name)
+        if group.upload_event is not None:
+            torch.cuda.current_stream(self._device_ordinal).wait_event(group.upload_event)
+            group.upload_event = None
         if not group.payload_loaded:
             source = group.source_tensor
             payload_bytes = source.numel() * source.element_size()
@@ -158,6 +162,40 @@ class VmmWeightArena:
         return group.tensor_view.tensor.narrow(0, 0, group.source_tensor.numel() * group.source_tensor.element_size()).view(
             group.source_tensor.dtype
         ).reshape(group.source_tensor.shape)
+
+    def prefetch_loaded_tensor(self, name: str, stream: Any) -> None:
+        """Populate a group on ``stream`` so its consumer can overlap compute."""
+        group = self._group(name)
+        if group.source_tensor is None or group.tensor_view is None:
+            raise WeightArenaError(f"weight group has no bound CPU tensor: {name}")
+        import torch
+
+        self.pin(name)
+        if group.payload_loaded:
+            return
+        source = group.source_tensor
+        payload_bytes = source.numel() * source.element_size()
+        destination = group.tensor_view.tensor.narrow(0, 0, payload_bytes).view(source.dtype).reshape(source.shape)
+        with torch.cuda.stream(stream):
+            destination.copy_(source, non_blocking=group.source_pinned)
+            event = torch.cuda.Event(enable_timing=False)
+            event.record(stream)
+        group.payload_loaded = True
+        group.upload_event = event
+
+    def wait_for_prefetch(self, name: str) -> Any:
+        """Wait for an asynchronous prefetch and return its typed CUDA view."""
+        group = self._group(name)
+        if group.upload_event is not None:
+            import torch
+
+            torch.cuda.current_stream(self._device_ordinal).wait_event(group.upload_event)
+            group.upload_event = None
+        if group.source_tensor is None or group.tensor_view is None:
+            raise WeightArenaError(f"weight group has no bound CPU tensor: {name}")
+        source = group.source_tensor
+        payload_bytes = source.numel() * source.element_size()
+        return group.tensor_view.tensor.narrow(0, 0, payload_bytes).view(source.dtype).reshape(source.shape)
 
     def release_after_current_stream(self, name: str) -> None:
         """Keep a pinned group resident until the current CUDA stream completes."""
