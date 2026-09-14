@@ -69,3 +69,35 @@ python -m ddo_vmm_allocator.native --library .\build\Release\ddo_vmm.dll --megab
 ```
 
 The bridge owns the VMM region with a context manager and deliberately does not expose the raw virtual address as a PyTorch tensor yet.
+
+## Experimental PyTorch allocator probe
+
+The native DLL also exports the two function pointers accepted by PyTorch's
+`CUDAPluggableAllocator`.  This is an isolated validation of allocator ABI and
+VMM pointer usability, not the final paging allocator.  It creates one VMM
+region per PyTorch allocation and must be run in a new Python process:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python .\scripts\vmm_torch_allocator_probe.py --library .\build\Release\ddo_vmm.dll --megabytes 64
+```
+
+Do not use this prototype for inference: it intentionally has no caching,
+stream-recording, pressure policy, or model-weight paging yet.
+
+## Fresh-process runner launcher
+
+The launcher installs the same experimental allocator before importing the
+target runner.  It changes only its child process and requires an explicit
+acknowledgement:
+
+```powershell
+python .\scripts\run_with_vmm_allocator.py `
+    --library .\build\Release\ddo_vmm.dll `
+    --python E:\ProjetosIA\ltx2.3-image-diffusers\.venv\Scripts\python.exe `
+    --experimental-allow-global-allocator `
+    E:\ProjetosIA\ltx2.3-image-diffusers\run_dynamic_modular_vmm_distilled.py --help
+```
+
+Use this launcher only with a small, isolated probe until the allocator gains
+stream-aware reuse and an explicit pressure/eviction policy.

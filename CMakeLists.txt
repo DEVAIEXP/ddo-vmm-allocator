@@ -8,6 +8,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(ddo_vmm SHARED
     native/src/ddo_vmm.cpp
+    native/src/ddo_vmm_torch_allocator.cpp
 )
 
 target_compile_features(ddo_vmm PRIVATE cxx_std_20)
