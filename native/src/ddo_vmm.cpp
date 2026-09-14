@@ -33,14 +33,19 @@ size_t align_up(size_t value, size_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
-bool device_properties(int ordinal, CUdevice* device, CUmemAllocationProp* properties) {
+bool device_properties(int ordinal, ddo_vmm_backing_kind backing_kind, CUdevice* device, CUmemAllocationProp* properties) {
     if (!checked(cuDeviceGet(device, ordinal), "cuDeviceGet")) {
         return false;
     }
     *properties = {};
     properties->type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    properties->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    properties->location.id = ordinal;
+    if (backing_kind == DDO_VMM_BACKING_HOST) {
+        properties->location.type = CU_MEM_LOCATION_TYPE_HOST;
+        properties->location.id = 0;
+    } else {
+        properties->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        properties->location.id = ordinal;
+    }
     properties->requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
     return true;
 }
@@ -76,6 +81,7 @@ struct ddo_vmm_region {
     size_t mapped_size = 0;
     CUmemGenericAllocationHandle allocation = 0;
     CUcontext retained_primary_context = nullptr;
+    ddo_vmm_backing_kind backing_kind = DDO_VMM_BACKING_DEVICE;
 };
 
 namespace {
@@ -101,6 +107,15 @@ extern "C" ddo_vmm_status ddo_vmm_region_create(
     size_t size_bytes,
     ddo_vmm_region** out_region
 ) {
+    return ddo_vmm_region_create_ex(device_ordinal, size_bytes, DDO_VMM_BACKING_DEVICE, out_region);
+}
+
+extern "C" ddo_vmm_status ddo_vmm_region_create_ex(
+    int device_ordinal,
+    size_t size_bytes,
+    ddo_vmm_backing_kind backing_kind,
+    ddo_vmm_region** out_region
+) {
     if (out_region == nullptr || size_bytes == 0 || device_ordinal < 0) {
         last_error = "device ordinal, size, and output pointer must be valid";
         return DDO_VMM_INVALID_ARGUMENT;
@@ -113,6 +128,7 @@ extern "C" ddo_vmm_status ddo_vmm_region_create(
     }
     auto region = std::make_unique<ddo_vmm_region>();
     region->device_ordinal = device_ordinal;
+    region->backing_kind = backing_kind;
     region->requested_size = size_bytes;
     if (!ensure_context(device_ordinal, &region->retained_primary_context)) {
         return DDO_VMM_CUDA_ERROR;
@@ -120,7 +136,7 @@ extern "C" ddo_vmm_status ddo_vmm_region_create(
 
     CUdevice device = 0;
     CUmemAllocationProp properties{};
-    if (!device_properties(device_ordinal, &device, &properties)) {
+    if (!device_properties(device_ordinal, backing_kind, &device, &properties)) {
         return DDO_VMM_CUDA_ERROR;
     }
 
@@ -261,7 +277,7 @@ extern "C" ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region) {
     }
     CUdevice device = 0;
     CUmemAllocationProp properties{};
-    if (!device_properties(region->device_ordinal, &device, &properties)) {
+    if (!device_properties(region->device_ordinal, region->backing_kind, &device, &properties)) {
         release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
         return DDO_VMM_CUDA_ERROR;
     }
@@ -317,7 +333,7 @@ extern "C" size_t ddo_vmm_device_granularity(int device_ordinal) {
     }
     CUdevice device = 0;
     CUmemAllocationProp properties{};
-    if (!device_properties(device_ordinal, &device, &properties)) {
+    if (!device_properties(device_ordinal, DDO_VMM_BACKING_DEVICE, &device, &properties)) {
         return 0;
     }
     size_t granularity = 0;

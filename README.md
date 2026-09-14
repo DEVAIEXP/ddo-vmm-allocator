@@ -133,6 +133,13 @@ python .\scripts\vmm_persistent_tensor_probe.py `
 Data is intentionally discarded by eviction; model code must repopulate a
 weight group before submitting kernels that use its persistent tensor view.
 
+The native API also exposes an experimental `host` backing kind for Driver VMM
+experiments.  CUDA reports those mappings as CPU DLPack tensors, so they are
+not valid PyTorch CUDA weight views and are intentionally not used by the
+transformer adapter.  The model path uses device-backed VMM allocations; a
+large materialized CUDA virtual set is what allows WDDM to page backing under
+Windows.
+
 ## PyTorch module adapter probe
 
 `VmmModuleAdapter` attaches a CPU-backed parameter to a module with explicit

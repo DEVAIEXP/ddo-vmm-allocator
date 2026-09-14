@@ -50,12 +50,14 @@ class VmmWeightArena:
         *,
         resident_budget_bytes: int,
         device_ordinal: int = 0,
+        backing: str = "device",
     ) -> None:
         if resident_budget_bytes <= 0:
             raise ValueError("resident_budget_bytes must be positive")
         self._library = library
         self._resident_budget_bytes = resident_budget_bytes
         self._device_ordinal = device_ordinal
+        self._backing = backing
         self._groups: dict[str, _WeightGroup] = {}
         self._lru: OrderedDict[str, None] = OrderedDict()
         self._closed = False
@@ -82,7 +84,7 @@ class VmmWeightArena:
             raise ValueError("weight-group name must be non-empty")
         if name in self._groups:
             raise WeightArenaError(f"weight group already exists: {name}")
-        region = self._library.create_region(size_bytes, self._device_ordinal)
+        region = self._library.create_region(size_bytes, self._device_ordinal, backing=self._backing)
         group = _WeightGroup(name=name, region=region)
         self._groups[name] = group
         self._lru[name] = None

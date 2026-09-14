@@ -26,6 +26,11 @@ typedef enum ddo_vmm_status {
     DDO_VMM_CUDA_ERROR = 3,
 } ddo_vmm_status;
 
+typedef enum ddo_vmm_backing_kind {
+    DDO_VMM_BACKING_DEVICE = 0,
+    DDO_VMM_BACKING_HOST = 1,
+} ddo_vmm_backing_kind;
+
 /**
  * Reserve a stable CUDA virtual address, create device-local physical backing,
  * map it, and grant read/write access to `device_ordinal`.
@@ -36,6 +41,13 @@ typedef enum ddo_vmm_status {
 DDO_VMM_API ddo_vmm_status ddo_vmm_region_create(
     int device_ordinal,
     size_t size_bytes,
+    ddo_vmm_region** out_region
+);
+
+DDO_VMM_API ddo_vmm_status ddo_vmm_region_create_ex(
+    int device_ordinal,
+    size_t size_bytes,
+    ddo_vmm_backing_kind backing_kind,
     ddo_vmm_region** out_region
 );
 

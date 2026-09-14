@@ -41,6 +41,13 @@ class NativeVmmLibrary:
             ctypes.POINTER(ctypes.c_void_p),
         ]
         self._library.ddo_vmm_region_create.restype = ctypes.c_int
+        self._library.ddo_vmm_region_create_ex.argtypes = [
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.ddo_vmm_region_create_ex.restype = ctypes.c_int
         self._library.ddo_vmm_region_destroy.argtypes = [ctypes.c_void_p]
         self._library.ddo_vmm_region_destroy.restype = None
         self._library.ddo_vmm_region_evict.argtypes = [ctypes.c_void_p]
@@ -70,11 +77,15 @@ class NativeVmmLibrary:
             raise NativeVmmError(self._last_error())
         return result
 
-    def create_region(self, size_bytes: int, device_ordinal: int = 0) -> "NativeVmmRegion":
+    def create_region(self, size_bytes: int, device_ordinal: int = 0, *, backing: str = "device") -> "NativeVmmRegion":
         if size_bytes <= 0:
             raise ValueError("size_bytes must be positive")
         handle = ctypes.c_void_p()
-        status = self._library.ddo_vmm_region_create(device_ordinal, size_bytes, ctypes.byref(handle))
+        if backing not in {"device", "host"}:
+            raise ValueError("backing must be 'device' or 'host'")
+        status = self._library.ddo_vmm_region_create_ex(
+            device_ordinal, size_bytes, 1 if backing == "host" else 0, ctypes.byref(handle)
+        )
         if status != 0 or not handle.value:
             raise NativeVmmError(self._last_error())
         return NativeVmmRegion(self, handle)
