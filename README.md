@@ -152,6 +152,14 @@ second layer forces a safe eviction/reload of the first layer while preserving
 the virtual tensor addresses.  Only after this probe passes should a model
 specific transformer adapter be added.
 
+For recursive transformer-style blocks, the tree adapter can be checked with:
+
+```powershell
+python .\scripts\vmm_module_tree_probe.py `
+    --library .\build\Release\ddo_vmm.dll `
+    --dimension 256
+```
+
 ## Tensor weight arena probe
 
 The tensor-aware arena binds CPU weights, reloads them whenever their VMM group

@@ -9,6 +9,7 @@ PyTorch's global allocator and does not depend on any external implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from .weight_arena import VmmWeightArena, WeightArenaError
@@ -116,6 +117,79 @@ class VmmModuleAdapter:
         self._handles.append(module.register_forward_pre_hook(before))
         self._handles.append(module.register_forward_hook(after))
         return [binding.group_name for binding in bindings]
+
+    def attach_module_tree(self, root: Any, module_pattern: str) -> list[str]:
+        """Attach descendant parameters and hooks for matching transformer blocks.
+
+        A block may contain nested attention/MLP linears, so ``recurse=False``
+        is not sufficient.  Parameters are still stored in separate VMM groups,
+        but the matching block's hook pins and releases all of them together.
+        Shared parameters are registered only once.
+        """
+        import torch
+
+        if not isinstance(root, torch.nn.Module):
+            raise TypeError("root must be a torch.nn.Module")
+        pattern = re.compile(module_pattern)
+        attached_ids: set[int] = set()
+        block_count = 0
+        names: list[str] = []
+        for block_name, block in root.named_modules():
+            if not block_name or not pattern.search(block_name):
+                continue
+            bindings: list[_Binding] = []
+            for relative_name, parameter in block.named_parameters(recurse=True):
+                if id(parameter) in attached_ids:
+                    continue
+                owner = block
+                pieces = relative_name.split(".")
+                for piece in pieces[:-1]:
+                    owner = getattr(owner, piece)
+                parameter_name = pieces[-1]
+                source = parameter.detach().to(device="cpu").contiguous()
+                group_name = f"{block_name}.{relative_name}"
+                if not self.arena.has_group(group_name):
+                    self.arena.reserve(group_name, source.numel() * source.element_size())
+                self.arena.bind_cpu_tensor(group_name, source)
+                stable = self.arena.persistent_tensor(group_name, dtype=source.dtype, shape=tuple(source.shape))
+                owner.register_parameter(parameter_name, torch.nn.Parameter(stable, requires_grad=False))
+                binding = _Binding(owner, parameter_name, group_name)
+                bindings.append(binding)
+                attached_ids.add(id(parameter))
+                names.append(group_name)
+            if not bindings:
+                continue
+            block_count += 1
+
+            def before(_module: Any, _args: tuple[Any, ...], bindings=bindings) -> None:
+                self.arena.collect_completed_events()
+                try:
+                    for binding in bindings:
+                        loaded = self.arena.pin_loaded_tensor(binding.group_name)
+                        binding.module.register_parameter(
+                            binding.parameter_name, torch.nn.Parameter(loaded, requires_grad=False)
+                        )
+                except WeightArenaError:
+                    self.arena.collect_completed_events(wait=True)
+                    for binding in bindings:
+                        loaded = self.arena.pin_loaded_tensor(binding.group_name)
+                        binding.module.register_parameter(
+                            binding.parameter_name, torch.nn.Parameter(loaded, requires_grad=False)
+                        )
+
+            def after(_module: Any, _args: tuple[Any, ...], _output: Any, bindings=bindings) -> Any:
+                for binding in bindings:
+                    self.arena.release_after_current_stream(binding.group_name)
+                return _output
+
+            self._handles.append(block.register_forward_pre_hook(before))
+            self._handles.append(block.register_forward_hook(after))
+        if block_count == 0:
+            raise ValueError(f"no modules matched {module_pattern!r}")
+        self._bindings.extend(
+            _Binding(root, "", name) for name in names
+        )
+        return names
 
     def close(self) -> None:
         for handle in self._handles:
