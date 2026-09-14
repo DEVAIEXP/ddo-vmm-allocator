@@ -115,6 +115,22 @@ The first arena probe is intentionally framework-free.  A caller must not
 unpin a group until all CUDA work using it has completed; the future tensor
 adapter will use CUDA events for asynchronous completion.
 
+## Persistent PyTorch tensor probe
+
+The tensor adapter creates one CUDA tensor while a VMM region is mapped.  It
+then evicts and rematerializes backing without recreating the tensor object or
+changing its device pointer:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python .\scripts\vmm_persistent_tensor_probe.py `
+    --library .\build\Release\ddo_vmm.dll `
+    --megabytes 32
+```
+
+Data is intentionally discarded by eviction; model code must repopulate a
+weight group before submitting kernels that use its persistent tensor view.
+
 ## Fresh-process runner launcher
 
 The launcher installs the same experimental allocator before importing the
