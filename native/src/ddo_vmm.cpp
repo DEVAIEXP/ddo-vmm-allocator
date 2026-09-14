@@ -78,6 +78,24 @@ struct ddo_vmm_region {
     CUcontext retained_primary_context = nullptr;
 };
 
+namespace {
+
+bool activate_region_context(const ddo_vmm_region* region, CUcontext* temporary_primary_context) {
+    if (region->retained_primary_context != nullptr) {
+        return checked(cuCtxSetCurrent(region->retained_primary_context), "cuCtxSetCurrent");
+    }
+    return ensure_context(region->device_ordinal, temporary_primary_context);
+}
+
+void release_temporary_primary_context(int device_ordinal, CUcontext temporary_primary_context) {
+    if (temporary_primary_context != nullptr) {
+        cuCtxSetCurrent(nullptr);
+        cuDevicePrimaryCtxRelease(device_ordinal);
+    }
+}
+
+}  // namespace
+
 extern "C" ddo_vmm_status ddo_vmm_region_create(
     int device_ordinal,
     size_t size_bytes,
@@ -176,10 +194,7 @@ extern "C" void ddo_vmm_region_destroy(ddo_vmm_region* region) {
     }
     if (cuInit(0) == CUDA_SUCCESS) {
         CUcontext temporary_primary_context = nullptr;
-        if (region->retained_primary_context != nullptr) {
-            cuCtxSetCurrent(region->retained_primary_context);
-        }
-        if (ensure_context(region->device_ordinal, &temporary_primary_context)) {
+        if (activate_region_context(region, &temporary_primary_context)) {
             if (region->address != 0 && region->mapped_size != 0) {
                 cuMemUnmap(region->address, region->mapped_size);
             }
@@ -190,16 +205,89 @@ extern "C" void ddo_vmm_region_destroy(ddo_vmm_region* region) {
                 cuMemAddressFree(region->address, region->mapped_size);
             }
         }
-        if (temporary_primary_context != nullptr) {
-            cuCtxSetCurrent(nullptr);
-            cuDevicePrimaryCtxRelease(region->device_ordinal);
-        }
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
         if (region->retained_primary_context != nullptr) {
             cuCtxSetCurrent(nullptr);
             cuDevicePrimaryCtxRelease(region->device_ordinal);
         }
     }
     delete region;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_region_evict(ddo_vmm_region* region) {
+    if (region == nullptr) {
+        last_error = "VMM region must be valid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    last_error.clear();
+    if (region->allocation == 0) {
+        return DDO_VMM_SUCCESS;
+    }
+    if (!checked(cuInit(0), "cuInit")) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    CUcontext temporary_primary_context = nullptr;
+    if (!activate_region_context(region, &temporary_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    if (!checked(cuMemUnmap(region->address, region->mapped_size), "cuMemUnmap")) {
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    if (!checked(cuMemRelease(region->allocation), "cuMemRelease")) {
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    region->allocation = 0;
+    release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region) {
+    if (region == nullptr) {
+        last_error = "VMM region must be valid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    last_error.clear();
+    if (region->allocation != 0) {
+        return DDO_VMM_SUCCESS;
+    }
+    if (!checked(cuInit(0), "cuInit")) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    CUcontext temporary_primary_context = nullptr;
+    if (!activate_region_context(region, &temporary_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    CUdevice device = 0;
+    CUmemAllocationProp properties{};
+    if (!device_properties(region->device_ordinal, &device, &properties)) {
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    CUmemGenericAllocationHandle allocation = 0;
+    if (!checked(cuMemCreate(&allocation, region->mapped_size, &properties, 0), "cuMemCreate")) {
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    if (!checked(cuMemMap(region->address, region->mapped_size, 0, allocation, 0), "cuMemMap")) {
+        cuMemRelease(allocation);
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = region->device_ordinal;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (!checked(cuMemSetAccess(region->address, region->mapped_size, &access, 1), "cuMemSetAccess")) {
+        cuMemUnmap(region->address, region->mapped_size);
+        cuMemRelease(allocation);
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    region->allocation = allocation;
+    release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+    return DDO_VMM_SUCCESS;
 }
 
 extern "C" uintptr_t ddo_vmm_region_address(const ddo_vmm_region* region) {
@@ -212,6 +300,10 @@ extern "C" size_t ddo_vmm_region_requested_size(const ddo_vmm_region* region) {
 
 extern "C" size_t ddo_vmm_region_mapped_size(const ddo_vmm_region* region) {
     return region == nullptr ? 0 : region->mapped_size;
+}
+
+extern "C" int ddo_vmm_region_is_materialized(const ddo_vmm_region* region) {
+    return region != nullptr && region->allocation != 0 ? 1 : 0;
 }
 
 extern "C" size_t ddo_vmm_device_granularity(int device_ordinal) {

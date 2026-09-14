@@ -68,7 +68,9 @@ $env:PYTHONPATH = "$PWD\src"
 python -m ddo_vmm_allocator.native --library .\build\Release\ddo_vmm.dll --megabytes 64
 ```
 
-The bridge owns the VMM region with a context manager and deliberately does not expose the raw virtual address as a PyTorch tensor yet.
+The bridge owns the VMM region with a context manager, validates an
+evict/rematerialize cycle at the same virtual address, and deliberately does
+not expose an unmapped raw address as a PyTorch tensor yet.
 
 ## Experimental PyTorch allocator probe
 

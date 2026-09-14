@@ -43,12 +43,18 @@ class NativeVmmLibrary:
         self._library.ddo_vmm_region_create.restype = ctypes.c_int
         self._library.ddo_vmm_region_destroy.argtypes = [ctypes.c_void_p]
         self._library.ddo_vmm_region_destroy.restype = None
+        self._library.ddo_vmm_region_evict.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_region_evict.restype = ctypes.c_int
+        self._library.ddo_vmm_region_materialize.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_region_materialize.restype = ctypes.c_int
         self._library.ddo_vmm_region_address.argtypes = [ctypes.c_void_p]
         self._library.ddo_vmm_region_address.restype = ctypes.c_size_t
         self._library.ddo_vmm_region_requested_size.argtypes = [ctypes.c_void_p]
         self._library.ddo_vmm_region_requested_size.restype = ctypes.c_size_t
         self._library.ddo_vmm_region_mapped_size.argtypes = [ctypes.c_void_p]
         self._library.ddo_vmm_region_mapped_size.restype = ctypes.c_size_t
+        self._library.ddo_vmm_region_is_materialized.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_region_is_materialized.restype = ctypes.c_int
         self._library.ddo_vmm_device_granularity.argtypes = [ctypes.c_int]
         self._library.ddo_vmm_device_granularity.restype = ctypes.c_size_t
         self._library.ddo_vmm_last_error.argtypes = []
@@ -95,6 +101,28 @@ class NativeVmmRegion:
             mapped_size=int(self._owner._library.ddo_vmm_region_mapped_size(self._handle)),
         )
 
+    @property
+    def materialized(self) -> bool:
+        if self._handle is None:
+            raise NativeVmmError("VMM region is closed")
+        return bool(self._owner._library.ddo_vmm_region_is_materialized(self._handle))
+
+    def evict(self) -> None:
+        """Unmap and release backing while retaining this object's virtual address."""
+
+        if self._handle is None:
+            raise NativeVmmError("VMM region is closed")
+        if self._owner._library.ddo_vmm_region_evict(self._handle) != 0:
+            raise NativeVmmError(self._owner._last_error())
+
+    def materialize(self) -> None:
+        """Map new device-local backing at the original virtual address."""
+
+        if self._handle is None:
+            raise NativeVmmError("VMM region is closed")
+        if self._owner._library.ddo_vmm_region_materialize(self._handle) != 0:
+            raise NativeVmmError(self._owner._last_error())
+
     def close(self) -> None:
         if self._handle is not None:
             self._owner._library.ddo_vmm_region_destroy(self._handle)
@@ -133,14 +161,20 @@ def main() -> None:
     library = load_native_vmm(args.library)
     with library.create_region(args.megabytes * 1024**2, args.device) as region:
         info = region.info
+        region.evict()
+        if region.materialized:
+            raise NativeVmmError("VMM region remained materialized after eviction")
+        region.materialize()
+        if not region.materialized or region.info.address != info.address:
+            raise NativeVmmError("VMM region did not rematerialize at its original virtual address")
         print("Native Python-to-VMM bridge: PASS")
         print(f"  library: {library.path}")
         print(f"  virtual address: 0x{info.address:x}")
         print(f"  requested: {info.requested_size / 1024**2:.2f} MiB")
         print(f"  mapped: {info.mapped_size / 1024**2:.2f} MiB")
         print(f"  granularity: {library.device_granularity(args.device) / 1024**2:.2f} MiB")
+        print("  evict/rematerialize at same address: PASS")
 
 
 if __name__ == "__main__":
     main()
-

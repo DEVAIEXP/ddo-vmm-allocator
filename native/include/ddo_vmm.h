@@ -42,13 +42,19 @@ DDO_VMM_API ddo_vmm_status ddo_vmm_region_create(
 /** Unmap, release physical backing, and return the virtual address reservation. */
 DDO_VMM_API void ddo_vmm_region_destroy(ddo_vmm_region* region);
 
+/** Release physical backing while preserving the region's reserved virtual address. */
+DDO_VMM_API ddo_vmm_status ddo_vmm_region_evict(ddo_vmm_region* region);
+
+/** Recreate device-local backing and map it at the region's original virtual address. */
+DDO_VMM_API ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region);
+
 DDO_VMM_API uintptr_t ddo_vmm_region_address(const ddo_vmm_region* region);
 DDO_VMM_API size_t ddo_vmm_region_requested_size(const ddo_vmm_region* region);
 DDO_VMM_API size_t ddo_vmm_region_mapped_size(const ddo_vmm_region* region);
+DDO_VMM_API int ddo_vmm_region_is_materialized(const ddo_vmm_region* region);
 DDO_VMM_API size_t ddo_vmm_device_granularity(int device_ordinal);
 DDO_VMM_API const char* ddo_vmm_last_error(void);
 
 #ifdef __cplusplus
 }
 #endif
-

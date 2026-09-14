@@ -48,11 +48,33 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
 
+        const uintptr_t original_address = ddo_vmm_region_address(region);
+        if (ddo_vmm_region_evict(region) != DDO_VMM_SUCCESS || ddo_vmm_region_is_materialized(region) != 0) {
+            std::cerr << "VMM eviction failed: " << ddo_vmm_last_error() << '\n';
+            ddo_vmm_region_destroy(region);
+            return EXIT_FAILURE;
+        }
+        if (
+            ddo_vmm_region_materialize(region) != DDO_VMM_SUCCESS
+            || ddo_vmm_region_is_materialized(region) != 1
+            || ddo_vmm_region_address(region) != original_address
+        ) {
+            std::cerr << "VMM rematerialization failed: " << ddo_vmm_last_error() << '\n';
+            ddo_vmm_region_destroy(region);
+            return EXIT_FAILURE;
+        }
+        if (cuMemsetD8(static_cast<CUdeviceptr>(original_address), 0x5A, ddo_vmm_region_mapped_size(region)) != CUDA_SUCCESS) {
+            std::cerr << "VMM rematerialized CUDA write failed\n";
+            ddo_vmm_region_destroy(region);
+            return EXIT_FAILURE;
+        }
+
         std::cout << "CUDA Driver VMM probe: PASS\n"
                   << "  virtual address: 0x" << std::hex << ddo_vmm_region_address(region) << std::dec << '\n'
                   << "  requested: " << (ddo_vmm_region_requested_size(region) / 1024.0 / 1024.0) << " MiB\n"
                   << "  mapped: " << (ddo_vmm_region_mapped_size(region) / 1024.0 / 1024.0) << " MiB\n"
-                  << "  granularity: " << (ddo_vmm_device_granularity(0) / 1024.0 / 1024.0) << " MiB\n";
+                  << "  granularity: " << (ddo_vmm_device_granularity(0) / 1024.0 / 1024.0) << " MiB\n"
+                  << "  evict/rematerialize at same address: PASS\n";
         ddo_vmm_region_destroy(region);
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
