@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Acknowledge that this replaces PyTorch's CUDA allocator in the child process",
     )
+    parser.add_argument(
+        "--allocator-cache-mib",
+        type=int,
+        default=0,
+        help="Maximum physical VMM cache retained by the child allocator; 0 releases allocations after stream completion.",
+    )
     parser.add_argument("target", type=Path, help="Python runner to execute")
     parser.add_argument("target_args", nargs=argparse.REMAINDER, help="Arguments passed to the target runner")
     return parser.parse_args()
@@ -45,6 +51,8 @@ def parse_args() -> argparse.Namespace:
 def run(args: argparse.Namespace) -> int:
     if not args.experimental_allow_global_allocator:
         raise SystemExit("pass --experimental-allow-global-allocator to start a child with this prototype")
+    if args.allocator_cache_mib < 0:
+        raise SystemExit("--allocator-cache-mib cannot be negative")
 
     library = args.library.resolve(strict=True)
     target = args.target.resolve(strict=True)
@@ -53,6 +61,7 @@ def run(args: argparse.Namespace) -> int:
 
     environment = os.environ.copy()
     environment["DDO_VMM_LIBRARY_PATH"] = str(library)
+    environment["DDO_VMM_TORCH_CACHE_MIB"] = str(args.allocator_cache_mib)
     existing_python_path = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = str(source_root) if not existing_python_path else str(source_root) + os.pathsep + existing_python_path
 
