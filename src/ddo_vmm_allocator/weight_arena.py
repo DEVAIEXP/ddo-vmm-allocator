@@ -52,14 +52,14 @@ class VmmWeightArena:
         self,
         library: NativeVmmLibrary,
         *,
-        resident_budget_bytes: int,
+        resident_budget_bytes: int | None,
         device_ordinal: int = 0,
         backing: str = "device",
         pin_source: bool = False,
         pin_source_budget_bytes: int | None = None,
     ) -> None:
-        if resident_budget_bytes <= 0:
-            raise ValueError("resident_budget_bytes must be positive")
+        if resident_budget_bytes is not None and resident_budget_bytes <= 0:
+            raise ValueError("resident_budget_bytes must be positive when specified")
         self._library = library
         self._resident_budget_bytes = resident_budget_bytes
         self._device_ordinal = device_ordinal
@@ -118,7 +118,7 @@ class VmmWeightArena:
             for name, group in self._groups.items()
         ]
     @property
-    def resident_budget_bytes(self) -> int:
+    def resident_budget_bytes(self) -> int | None:
         return self._resident_budget_bytes
 
     def has_group(self, name: str) -> bool:
@@ -533,6 +533,10 @@ class VmmWeightArena:
 
     def _make_room_for(self, group: _WeightGroup, *, protected_name: str) -> None:
         if group.region.materialized:
+            return
+        if self._resident_budget_bytes is None:
+            # The native bridge applies its own LRU eviction only after CUDA
+            # reports pressure.  No Python-side limit is imposed here.
             return
         required_bytes = group.region.info.mapped_size
         if required_bytes > self._resident_budget_bytes:
