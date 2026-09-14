@@ -15,6 +15,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--megabytes", type=int, default=64)
     parser.add_argument("--cache-mib", type=int, default=0)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument(
+        "--verify-stream-lifetime",
+        action="store_true",
+        help="Exercise allocator reuse after an asynchronous CUDA-stream free.",
+    )
     return parser.parse_args()
 
 
@@ -74,6 +79,25 @@ def run(args: argparse.Namespace) -> None:
         if reused_address is not None and reused_address != address:
             raise RuntimeError("VMM cache did not reuse the stable virtual address")
 
+        if args.verify_stream_lifetime:
+            stream = torch.cuda.Stream(device=args.device)
+            with torch.cuda.stream(stream):
+                asynchronous = torch.empty(bytes_requested, dtype=torch.uint8, device="cuda")
+                asynchronous.fill_(0x5A)
+                asynchronous_address = asynchronous.data_ptr()
+                del asynchronous
+            gc.collect()
+            # Reusing a cached mapping must wait for the freeing stream.  A
+            # write on the default stream makes a premature unmap observable.
+            replacement = torch.empty(bytes_requested, dtype=torch.uint8, device="cuda")
+            replacement.fill_(0x3C)
+            torch.cuda.synchronize(args.device)
+            if replacement.data_ptr() != asynchronous_address:
+                raise RuntimeError("VMM cache did not reuse the asynchronous stream allocation")
+            del replacement
+            gc.collect()
+            torch.cuda.synchronize(args.device)
+
     print("PyTorch CUDAPluggableAllocator VMM probe: PASS")
     print(f"  torch: {torch.__version__}")
     print(f"  requested: {args.megabytes:.2f} MiB")
@@ -83,6 +107,8 @@ def run(args: argparse.Namespace) -> None:
     print(f"  VMM cached after free: {int(native.ddo_vmm_torch_cached_mapped_bytes()) / 1024**2:.2f} MiB")
     if reused_address is not None:
         print(f"  stable address reused: 0x{reused_address:x}")
+    if args.verify_stream_lifetime:
+        print("  asynchronous stream lifetime: verified")
 
 
 if __name__ == "__main__":
