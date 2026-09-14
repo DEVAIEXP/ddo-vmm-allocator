@@ -95,7 +95,8 @@ python .\scripts\vmm_torch_allocator_probe.py --library .\build\Release\ddo_vmm.
 
 The cache is exact-process state.  On a new-allocation failure it is drained
 before one retry, so idle cached regions cannot turn a potential allocation
-into an immediate OOM.  Stream-aware reuse and model paging remain pending.
+into an immediate OOM. Stream-aware reuse in the global PyTorch allocator
+remains pending; model-weight paging is handled separately by the weight arena.
 
 ## Weight-residency arena
 
@@ -111,9 +112,10 @@ python .\scripts\vmm_weight_arena_probe.py `
     --resident-megabytes 64
 ```
 
-The first arena probe is intentionally framework-free.  A caller must not
-unpin a group until all CUDA work using it has completed; the future tensor
-adapter will use CUDA events for asynchronous completion.
+The first arena probe is intentionally framework-free. A caller must not
+unpin a group until all CUDA work using it has completed; the tensor adapter
+provides `release_after_current_stream()` and `collect_completed_events()` for
+asynchronous CUDA completion.
 
 ## Persistent PyTorch tensor probe
 
@@ -130,6 +132,18 @@ python .\scripts\vmm_persistent_tensor_probe.py `
 
 Data is intentionally discarded by eviction; model code must repopulate a
 weight group before submitting kernels that use its persistent tensor view.
+
+## Tensor weight arena probe
+
+The tensor-aware arena binds CPU weights, reloads them whenever their VMM group
+is materialized, and delays unpinning with a CUDA event:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python .\scripts\vmm_tensor_weight_arena_probe.py `
+    --library .\build\Release\ddo_vmm.dll `
+    --megabytes 16
+```
 
 ## Fresh-process runner launcher
 
