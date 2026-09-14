@@ -10,10 +10,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -24,11 +29,85 @@ struct AllocationRecord {
         nullptr, &ddo_vmm_region_destroy
     };
     size_t mapped_size = 0;
+    int device_ordinal = -1;
 };
 
 std::mutex allocations_mutex;
 std::unordered_map<void*, AllocationRecord> allocations;
+std::multimap<size_t, AllocationRecord> cached_allocations;
 size_t live_mapped_bytes = 0;
+size_t cached_mapped_bytes = 0;
+
+std::string environment_value(const char* name) {
+#if defined(_WIN32)
+    char* raw_value = nullptr;
+    size_t raw_length = 0;
+    if (_dupenv_s(&raw_value, &raw_length, name) != 0 || raw_value == nullptr) {
+        return {};
+    }
+    std::string value(raw_value, raw_length == 0 ? 0 : raw_length - 1);
+    std::free(raw_value);
+    return value;
+#else
+    const char* value = std::getenv(name);
+    return value == nullptr ? std::string{} : std::string(value);
+#endif
+}
+
+size_t cache_limit_bytes() {
+    const std::string value = environment_value("DDO_VMM_TORCH_CACHE_MIB");
+    if (value.empty()) {
+        return 0;
+    }
+    char* end = nullptr;
+    const unsigned long long mebibytes = std::strtoull(value.c_str(), &end, 10);
+    constexpr size_t bytes_per_mebibyte = 1024ULL * 1024ULL;
+    if (
+        end == value.c_str() || *end != '\0'
+        || mebibytes > std::numeric_limits<size_t>::max() / bytes_per_mebibyte
+    ) {
+        return 0;
+    }
+    return static_cast<size_t>(mebibytes) * bytes_per_mebibyte;
+}
+
+void release_records(std::vector<AllocationRecord>& records) {
+    for (AllocationRecord& record : records) {
+        record.region.reset();
+    }
+}
+
+bool take_cached_allocation(
+    size_t minimum_mapped_size,
+    int device_ordinal,
+    AllocationRecord* out_record
+) {
+    std::scoped_lock lock(allocations_mutex);
+    for (auto candidate = cached_allocations.lower_bound(minimum_mapped_size);
+         candidate != cached_allocations.end(); ++candidate) {
+        if (candidate->second.device_ordinal != device_ordinal) {
+            continue;
+        }
+        *out_record = std::move(candidate->second);
+        cached_mapped_bytes -= out_record->mapped_size;
+        cached_allocations.erase(candidate);
+        return true;
+    }
+    return false;
+}
+
+std::vector<AllocationRecord> drain_cached_allocations() {
+    std::vector<AllocationRecord> evicted;
+    std::scoped_lock lock(allocations_mutex);
+    evicted.reserve(cached_allocations.size());
+    for (auto& [size, record] : cached_allocations) {
+        (void)size;
+        evicted.push_back(std::move(record));
+    }
+    cached_allocations.clear();
+    cached_mapped_bytes = 0;
+    return evicted;
+}
 
 }  // namespace
 
@@ -40,34 +119,48 @@ extern "C" DDO_VMM_API void* ddo_vmm_torch_malloc(
     // PyTorch may request a zero-byte tensor.  It still needs a unique,
     // non-null allocation record to preserve its allocator bookkeeping.
     const size_t requested_size = size_bytes == 0 ? kMinimumTorchAllocationBytes : size_bytes;
-    ddo_vmm_region* raw_region = nullptr;
-    if (ddo_vmm_region_create(device_ordinal, requested_size, &raw_region) != DDO_VMM_SUCCESS) {
+    const size_t granularity = ddo_vmm_device_granularity(device_ordinal);
+    if (granularity == 0 || requested_size > std::numeric_limits<size_t>::max() - (granularity - 1)) {
         return nullptr;
     }
+    const size_t minimum_mapped_size = ((requested_size + granularity - 1) / granularity) * granularity;
 
-    const uintptr_t address = ddo_vmm_region_address(raw_region);
-    const size_t mapped_size = ddo_vmm_region_mapped_size(raw_region);
-    if (address == 0 || mapped_size == 0) {
-        ddo_vmm_region_destroy(raw_region);
+    AllocationRecord record;
+    if (!take_cached_allocation(minimum_mapped_size, device_ordinal, &record)) {
+        ddo_vmm_region* raw_region = nullptr;
+        if (ddo_vmm_region_create(device_ordinal, requested_size, &raw_region) != DDO_VMM_SUCCESS) {
+            // A full cache must never make a new allocation fail.  Release
+            // cached physical backing and retry once before reporting OOM.
+            auto evicted = drain_cached_allocations();
+            release_records(evicted);
+            if (ddo_vmm_region_create(device_ordinal, requested_size, &raw_region) != DDO_VMM_SUCCESS) {
+                return nullptr;
+            }
+        }
+        record.region = std::unique_ptr<ddo_vmm_region, decltype(&ddo_vmm_region_destroy)>(
+            raw_region, &ddo_vmm_region_destroy
+        );
+        record.mapped_size = ddo_vmm_region_mapped_size(raw_region);
+        record.device_ordinal = device_ordinal;
+    }
+    const uintptr_t address = ddo_vmm_region_address(record.region.get());
+    if (address == 0 || record.mapped_size == 0) {
         return nullptr;
     }
-    auto region = std::unique_ptr<ddo_vmm_region, decltype(&ddo_vmm_region_destroy)>(
-        raw_region, &ddo_vmm_region_destroy
-    );
     void* pointer = reinterpret_cast<void*>(address);
 
     std::scoped_lock lock(allocations_mutex);
     const auto [entry, inserted] = allocations.emplace(
-        pointer, AllocationRecord{std::move(region), mapped_size}
+        pointer, std::move(record)
     );
     if (!inserted) {
         return nullptr;
     }
-    if (mapped_size > std::numeric_limits<size_t>::max() - live_mapped_bytes) {
+    if (entry->second.mapped_size > std::numeric_limits<size_t>::max() - live_mapped_bytes) {
         allocations.erase(entry);
         return nullptr;
     }
-    live_mapped_bytes += mapped_size;
+    live_mapped_bytes += entry->second.mapped_size;
     return pointer;
 }
 
@@ -81,6 +174,7 @@ extern "C" DDO_VMM_API void ddo_vmm_torch_free(
         return;
     }
     AllocationRecord record;
+    std::vector<AllocationRecord> evicted;
     {
         std::scoped_lock lock(allocations_mutex);
         const auto found = allocations.find(pointer);
@@ -90,9 +184,26 @@ extern "C" DDO_VMM_API void ddo_vmm_torch_free(
         record = std::move(found->second);
         live_mapped_bytes -= record.mapped_size;
         allocations.erase(found);
+
+        const size_t cache_limit = cache_limit_bytes();
+        if (cache_limit != 0 && record.mapped_size <= cache_limit) {
+            while (
+                !cached_allocations.empty()
+                && (cached_mapped_bytes > cache_limit || record.mapped_size > cache_limit - cached_mapped_bytes)
+            ) {
+                auto candidate = cached_allocations.begin();
+                cached_mapped_bytes -= candidate->second.mapped_size;
+                evicted.push_back(std::move(candidate->second));
+                cached_allocations.erase(candidate);
+            }
+            cached_mapped_bytes += record.mapped_size;
+            cached_allocations.emplace(record.mapped_size, std::move(record));
+            return;
+        }
     }
     // Release outside the lock because CUDA Driver calls may block.
     record.region.reset();
+    release_records(evicted);
 }
 
 extern "C" DDO_VMM_API size_t ddo_vmm_torch_live_allocation_count(void) {
@@ -105,3 +216,12 @@ extern "C" DDO_VMM_API size_t ddo_vmm_torch_live_mapped_bytes(void) {
     return live_mapped_bytes;
 }
 
+extern "C" DDO_VMM_API size_t ddo_vmm_torch_cached_allocation_count(void) {
+    std::scoped_lock lock(allocations_mutex);
+    return cached_allocations.size();
+}
+
+extern "C" DDO_VMM_API size_t ddo_vmm_torch_cached_mapped_bytes(void) {
+    std::scoped_lock lock(allocations_mutex);
+    return cached_mapped_bytes;
+}

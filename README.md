@@ -85,6 +85,16 @@ python .\scripts\vmm_torch_allocator_probe.py --library .\build\Release\ddo_vmm.
 Do not use this prototype for inference: it intentionally has no caching,
 stream-recording, pressure policy, or model-weight paging yet.
 
+Set a bounded cache in MiB to reuse free VMM mappings in the isolated probe:
+
+```powershell
+python .\scripts\vmm_torch_allocator_probe.py --library .\build\Release\ddo_vmm.dll --megabytes 64 --cache-mib 128
+```
+
+The cache is exact-process state.  On a new-allocation failure it is drained
+before one retry, so idle cached regions cannot turn a potential allocation
+into an immediate OOM.  Stream-aware reuse and model paging remain pending.
+
 ## Fresh-process runner launcher
 
 The launcher installs the same experimental allocator before importing the
