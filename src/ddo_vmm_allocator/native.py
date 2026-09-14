@@ -64,6 +64,16 @@ class NativeVmmLibrary:
         self._library.ddo_vmm_region_is_materialized.restype = ctypes.c_int
         self._library.ddo_vmm_device_granularity.argtypes = [ctypes.c_int]
         self._library.ddo_vmm_device_granularity.restype = ctypes.c_size_t
+        self._library.ddo_vmm_pressure_register.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_pressure_register.restype = None
+        self._library.ddo_vmm_pressure_unregister.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_pressure_unregister.restype = None
+        self._library.ddo_vmm_pressure_set_pinned.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._library.ddo_vmm_pressure_set_pinned.restype = None
+        self._library.ddo_vmm_pressure_touch.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_pressure_touch.restype = None
+        self._library.ddo_vmm_pressure_evict_one.argtypes = [ctypes.c_int]
+        self._library.ddo_vmm_pressure_evict_one.restype = ctypes.c_int
         self._library.ddo_vmm_last_error.argtypes = []
         self._library.ddo_vmm_last_error.restype = ctypes.c_char_p
 
@@ -76,6 +86,9 @@ class NativeVmmLibrary:
         if result == 0:
             raise NativeVmmError(self._last_error())
         return result
+
+    def pressure_evict_one(self, device_ordinal: int = 0) -> bool:
+        return bool(self._library.ddo_vmm_pressure_evict_one(device_ordinal))
 
     def create_region(self, size_bytes: int, device_ordinal: int = 0, *, backing: str = "device") -> "NativeVmmRegion":
         if size_bytes <= 0:
@@ -97,6 +110,7 @@ class NativeVmmRegion:
     def __init__(self, owner: NativeVmmLibrary, handle: ctypes.c_void_p) -> None:
         self._owner = owner
         self._handle: ctypes.c_void_p | None = handle
+        self._owner._library.ddo_vmm_pressure_register(handle)
 
     @property
     def closed(self) -> bool:
@@ -134,8 +148,19 @@ class NativeVmmRegion:
         if self._owner._library.ddo_vmm_region_materialize(self._handle) != 0:
             raise NativeVmmError(self._owner._last_error())
 
+    def set_pressure_pinned(self, pinned: bool) -> None:
+        if self._handle is None:
+            raise NativeVmmError("VMM region is closed")
+        self._owner._library.ddo_vmm_pressure_set_pinned(self._handle, int(pinned))
+
+    def touch_pressure(self) -> None:
+        if self._handle is None:
+            raise NativeVmmError("VMM region is closed")
+        self._owner._library.ddo_vmm_pressure_touch(self._handle)
+
     def close(self) -> None:
         if self._handle is not None:
+            self._owner._library.ddo_vmm_pressure_unregister(self._handle)
             self._owner._library.ddo_vmm_region_destroy(self._handle)
             self._handle = None
 

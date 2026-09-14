@@ -461,6 +461,11 @@ class VmmWeightArena:
 
     def materialize(self, name: str) -> WeightGroupView:
         group = self._group(name)
+        if not group.region.materialized:
+            # Native allocator pressure may have released this stable range
+            # since its last Python-side use.  Its data must be uploaded again.
+            group.payload_loaded = False
+            group.upload_event = None
         self._make_room_for(group, protected_name=name)
         group.region.materialize()
         self._touch(name)
@@ -470,6 +475,7 @@ class VmmWeightArena:
         group = self._group(name)
         self.materialize(name)
         group.pin_count += 1
+        group.region.set_pressure_pinned(True)
         self._touch(name)
         return self.view(name)
 
@@ -478,6 +484,8 @@ class VmmWeightArena:
         if group.pin_count == 0:
             raise WeightArenaError(f"weight group is not pinned: {name}")
         group.pin_count -= 1
+        if group.pin_count == 0:
+            group.region.set_pressure_pinned(False)
         self._touch(name)
         return self.view(name)
 
@@ -549,6 +557,7 @@ class VmmWeightArena:
 
     def _touch(self, name: str) -> None:
         self._lru.move_to_end(name)
+        self._groups[name].region.touch_pressure()
 
     @staticmethod
     def _evict(group: _WeightGroup) -> None:

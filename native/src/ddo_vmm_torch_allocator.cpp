@@ -206,7 +206,17 @@ extern "C" DDO_VMM_API void* ddo_vmm_torch_malloc(
             auto evicted = drain_cached_allocations();
             release_records(evicted);
             if (ddo_vmm_region_create(device_ordinal, requested_size, &raw_region) != DDO_VMM_SUCCESS) {
-                return nullptr;
+                // Model-weight mappings have their own stable virtual ranges.
+                // Reclaim only an unpinned, least-recently-used range and retry
+                // until no safe candidate remains.
+                while (ddo_vmm_pressure_evict_one(device_ordinal)) {
+                    if (ddo_vmm_region_create(device_ordinal, requested_size, &raw_region) == DDO_VMM_SUCCESS) {
+                        break;
+                    }
+                }
+                if (raw_region == nullptr) {
+                    return nullptr;
+                }
             }
         }
         record.region = std::unique_ptr<ddo_vmm_region, decltype(&ddo_vmm_region_destroy)>(

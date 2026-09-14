@@ -4,7 +4,9 @@
 
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -83,6 +85,29 @@ struct ddo_vmm_region {
     CUcontext retained_primary_context = nullptr;
     ddo_vmm_backing_kind backing_kind = DDO_VMM_BACKING_DEVICE;
 };
+
+namespace {
+
+struct PressureEntry {
+    ddo_vmm_region* region = nullptr;
+    bool pinned = false;
+    uint64_t touch = 0;
+};
+
+std::mutex pressure_mutex;
+std::vector<PressureEntry> pressure_entries;
+uint64_t pressure_clock = 0;
+
+PressureEntry* pressure_entry(ddo_vmm_region* region) {
+    for (PressureEntry& entry : pressure_entries) {
+        if (entry.region == region) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
 
 namespace {
 
@@ -208,6 +233,7 @@ extern "C" void ddo_vmm_region_destroy(ddo_vmm_region* region) {
     if (region == nullptr) {
         return;
     }
+    ddo_vmm_pressure_unregister(region);
     if (cuInit(0) == CUDA_SUCCESS) {
         CUcontext temporary_primary_context = nullptr;
         if (activate_region_context(region, &temporary_primary_context)) {
@@ -282,7 +308,15 @@ extern "C" ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region) {
         return DDO_VMM_CUDA_ERROR;
     }
     CUmemGenericAllocationHandle allocation = 0;
-    if (!checked(cuMemCreate(&allocation, region->mapped_size, &properties, 0), "cuMemCreate")) {
+    while (cuMemCreate(&allocation, region->mapped_size, &properties, 0) != CUDA_SUCCESS) {
+        allocation = 0;
+        if (!ddo_vmm_pressure_evict_one(region->device_ordinal)) {
+            set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
+            release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+            return DDO_VMM_OUT_OF_MEMORY;
+        }
+    }
+    if (allocation == 0) {
         release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
         return DDO_VMM_OUT_OF_MEMORY;
     }
@@ -350,6 +384,65 @@ extern "C" size_t ddo_vmm_device_granularity(int device_ordinal) {
         cuDevicePrimaryCtxRelease(device_ordinal);
     }
     return result;
+}
+
+extern "C" void ddo_vmm_pressure_register(ddo_vmm_region* region) {
+    if (region == nullptr) {
+        return;
+    }
+    std::scoped_lock lock(pressure_mutex);
+    if (pressure_entry(region) == nullptr) {
+        pressure_entries.push_back({region, false, ++pressure_clock});
+    }
+}
+
+extern "C" void ddo_vmm_pressure_unregister(ddo_vmm_region* region) {
+    std::scoped_lock lock(pressure_mutex);
+    for (auto entry = pressure_entries.begin(); entry != pressure_entries.end(); ++entry) {
+        if (entry->region == region) {
+            pressure_entries.erase(entry);
+            return;
+        }
+    }
+}
+
+extern "C" void ddo_vmm_pressure_set_pinned(ddo_vmm_region* region, int pinned) {
+    std::scoped_lock lock(pressure_mutex);
+    if (PressureEntry* entry = pressure_entry(region)) {
+        entry->pinned = pinned != 0;
+        entry->touch = ++pressure_clock;
+    }
+}
+
+extern "C" void ddo_vmm_pressure_touch(ddo_vmm_region* region) {
+    std::scoped_lock lock(pressure_mutex);
+    if (PressureEntry* entry = pressure_entry(region)) {
+        entry->touch = ++pressure_clock;
+    }
+}
+
+extern "C" int ddo_vmm_pressure_evict_one(int device_ordinal) {
+    std::scoped_lock lock(pressure_mutex);
+    PressureEntry* selected = nullptr;
+    for (PressureEntry& entry : pressure_entries) {
+        if (
+            entry.region == nullptr || entry.pinned || entry.region->device_ordinal != device_ordinal
+            || entry.region->allocation == 0
+        ) {
+            continue;
+        }
+        if (selected == nullptr || entry.touch < selected->touch) {
+            selected = &entry;
+        }
+    }
+    if (selected == nullptr) {
+        return 0;
+    }
+    if (ddo_vmm_region_evict(selected->region) != DDO_VMM_SUCCESS) {
+        return 0;
+    }
+    selected->touch = ++pressure_clock;
+    return 1;
 }
 
 extern "C" const char* ddo_vmm_last_error(void) {

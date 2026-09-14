@@ -65,6 +65,14 @@ DDO_VMM_API size_t ddo_vmm_region_requested_size(const ddo_vmm_region* region);
 DDO_VMM_API size_t ddo_vmm_region_mapped_size(const ddo_vmm_region* region);
 DDO_VMM_API int ddo_vmm_region_is_materialized(const ddo_vmm_region* region);
 DDO_VMM_API size_t ddo_vmm_device_granularity(int device_ordinal);
+
+/** Register model-weight regions that may be evicted under allocator pressure. */
+DDO_VMM_API void ddo_vmm_pressure_register(ddo_vmm_region* region);
+DDO_VMM_API void ddo_vmm_pressure_unregister(ddo_vmm_region* region);
+DDO_VMM_API void ddo_vmm_pressure_set_pinned(ddo_vmm_region* region, int pinned);
+DDO_VMM_API void ddo_vmm_pressure_touch(ddo_vmm_region* region);
+/** Evict one least-recently-used unpinned region for a device; returns 1 on success. */
+DDO_VMM_API int ddo_vmm_pressure_evict_one(int device_ordinal);
 DDO_VMM_API const char* ddo_vmm_last_error(void);
 
 #ifdef __cplusplus
