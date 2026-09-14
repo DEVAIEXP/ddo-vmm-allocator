@@ -11,6 +11,7 @@ import argparse
 from pathlib import Path
 import re
 import sys
+import time
 
 
 def main() -> None:
@@ -20,6 +21,7 @@ def main() -> None:
     parser.add_argument("--pattern", default=r"transformer_blocks\.0$")
     parser.add_argument("--resident-budget-gb", type=float, default=1.0)
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    parser.add_argument("--materialize", action="store_true", help="reload each attached group once")
     args = parser.parse_args()
 
     import torch
@@ -47,11 +49,22 @@ def main() -> None:
     arena = VmmWeightArena(library, resident_budget_bytes=int(args.resident_budget_gb * 2**30))
     adapter = VmmModuleAdapter(arena)
     attached = adapter.attach_module_tree(model, args.pattern)
+    materialize_seconds = 0.0
+    if args.materialize:
+        started = time.perf_counter()
+        for group_name in attached:
+            arena.pin_loaded_tensor(group_name)
+            torch.cuda.synchronize()
+            arena.release_after_current_stream(group_name)
+            arena.collect_completed_events(wait=True)
+        materialize_seconds = time.perf_counter() - started
     print("Diffusers transformer VMM attach probe: PASS")
     print(f"  model: {args.model_path}")
     print(f"  matched modules: {len(matches)}")
     print(f"  attached weight groups: {len(attached)}")
     print(f"  resident budget: {args.resident_budget_gb:.2f} GiB")
+    if args.materialize:
+        print(f"  materialize/release: {materialize_seconds:.3f}s")
     adapter.close()
     arena.close()
 
