@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import re
 from typing import Any
 
+from .native import NativeVmmError
 from .weight_arena import VmmWeightArena, WeightArenaError
 
 
@@ -177,14 +178,14 @@ class VmmModuleAdapter:
                 temporary_views = None
                 try:
                     self.arena.prefetch_loaded_group(group_name, copy_stream)
-                except WeightArenaError:
+                except (WeightArenaError, NativeVmmError):
                     # The current group is mandatory.  If a previously launched
                     # kernel still pins the available budget, wait rather than
                     # allocating outside the arena's bound.
                     self.arena.collect_completed_events(wait=True)
                     try:
                         self.arena.pin_loaded_group(group_name)
-                    except WeightArenaError:
+                    except (WeightArenaError, NativeVmmError):
                         # VMM local backing is full.  Keep the stable virtual
                         # view intact and execute this block from one ordinary
                         # CUDA temporary, then release it after the hook.
@@ -196,7 +197,7 @@ class VmmModuleAdapter:
                     if next_index < len(block_entries):
                         try:
                             self.arena.prefetch_loaded_group(block_entries[next_index], copy_stream)
-                        except WeightArenaError:
+                        except (WeightArenaError, NativeVmmError):
                             # Look-ahead is optional.  A sub-page resident
                             # budget may fit one rounded block but not two.
                             pass
