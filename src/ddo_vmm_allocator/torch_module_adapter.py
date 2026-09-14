@@ -30,6 +30,18 @@ class VmmModuleAdapter:
         self.arena = arena
         self._bindings: list[_Binding] = []
         self._handles: list[Any] = []
+        self._temporary_lifetimes: list[tuple[Any, dict[str, Any]]] = []
+
+    def _collect_temporary_lifetimes(self, *, wait: bool = False) -> None:
+        import torch
+
+        pending: list[tuple[Any, dict[str, Any]]] = []
+        for event, views in self._temporary_lifetimes:
+            if wait and not event.query():
+                event.synchronize()
+            if not event.query():
+                pending.append((event, views))
+        self._temporary_lifetimes = pending
 
     def attach_parameter(self, module: Any, parameter_name: str, group_name: str, source: Any) -> Any:
         """Bind ``source`` and replace the module parameter with a stable view."""
@@ -174,6 +186,7 @@ class VmmModuleAdapter:
 
             def before(_module: Any, _args: tuple[Any, ...], *, group_name=block_name, group_index=block_index) -> None:
                 nonlocal temporary_views
+                self._collect_temporary_lifetimes()
                 self.arena.collect_completed_events()
                 temporary_views = None
                 try:
@@ -206,6 +219,9 @@ class VmmModuleAdapter:
             def after(_module: Any, _args: tuple[Any, ...], _output: Any, *, group_name=block_name) -> Any:
                 nonlocal temporary_views
                 if temporary_views is not None:
+                    event = torch.cuda.Event(enable_timing=False)
+                    event.record(torch.cuda.current_stream(self.arena._device_ordinal))
+                    self._temporary_lifetimes.append((event, temporary_views))
                     for relative_name, owner, parameter_name, _source in entries:
                         owner._parameters[parameter_name].data = stable_data[relative_name]
                     temporary_views = None
@@ -221,6 +237,8 @@ class VmmModuleAdapter:
         return group_names
 
     def close(self) -> None:
+        self._collect_temporary_lifetimes(wait=True)
+        self._temporary_lifetimes.clear()
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
