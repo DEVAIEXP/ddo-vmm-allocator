@@ -19,6 +19,10 @@ target_include_directories(ddo_vmm
 )
 target_link_libraries(ddo_vmm PRIVATE CUDA::cuda_driver)
 
+if(WIN32)
+    target_link_libraries(ddo_vmm PRIVATE dxgi)
+endif()
+
 if(MSVC)
     target_compile_options(ddo_vmm PRIVATE /W4 /permissive-)
 else()

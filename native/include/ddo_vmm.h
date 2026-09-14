@@ -31,6 +31,15 @@ typedef enum ddo_vmm_backing_kind {
     DDO_VMM_BACKING_HOST = 1,
 } ddo_vmm_backing_kind;
 
+typedef struct ddo_vmm_windows_memory_info {
+    uint64_t local_budget_bytes;
+    uint64_t local_usage_bytes;
+    uint64_t nonlocal_budget_bytes;
+    uint64_t nonlocal_usage_bytes;
+    uint64_t available_physical_bytes;
+    uint64_t available_commit_bytes;
+} ddo_vmm_windows_memory_info;
+
 /**
  * Reserve a stable CUDA virtual address, create device-local physical backing,
  * map it, and grant read/write access to `device_ordinal`.
@@ -73,6 +82,15 @@ DDO_VMM_API void ddo_vmm_pressure_set_pinned(ddo_vmm_region* region, int pinned)
 DDO_VMM_API void ddo_vmm_pressure_touch(ddo_vmm_region* region);
 /** Evict one least-recently-used unpinned region for a device; returns 1 on success. */
 DDO_VMM_API int ddo_vmm_pressure_evict_one(int device_ordinal);
+DDO_VMM_API ddo_vmm_status ddo_vmm_windows_memory_query(
+    int device_ordinal, ddo_vmm_windows_memory_info* out_info
+);
+DDO_VMM_API ddo_vmm_status ddo_vmm_dxgi_budget_guard_set(
+    int device_ordinal,
+    uint64_t local_headroom_bytes,
+    uint64_t nonlocal_headroom_bytes,
+    uint64_t system_headroom_bytes
+);
 DDO_VMM_API const char* ddo_vmm_last_error(void);
 
 #ifdef __cplusplus

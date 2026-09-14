@@ -2,11 +2,20 @@
 
 #include <cuda.h>
 
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dxgi1_4.h>
+#endif
 
 namespace {
 
@@ -98,6 +107,15 @@ std::mutex pressure_mutex;
 std::vector<PressureEntry> pressure_entries;
 uint64_t pressure_clock = 0;
 
+struct DxgiBudgetGuardConfig {
+    uint64_t local_reserve_bytes = 0;
+    uint64_t shared_reserve_bytes = 0;
+    uint64_t system_reserve_bytes = 0;
+};
+
+std::mutex dxgi_budget_guard_mutex;
+std::vector<std::pair<int, DxgiBudgetGuardConfig>> dxgi_budget_guards;
+
 PressureEntry* pressure_entry(ddo_vmm_region* region) {
     for (PressureEntry& entry : pressure_entries) {
         if (entry.region == region) {
@@ -108,6 +126,104 @@ PressureEntry* pressure_entry(ddo_vmm_region* region) {
 }
 
 }  // namespace
+
+#if defined(_WIN32)
+bool query_windows_memory(int device_ordinal, ddo_vmm_windows_memory_info* out_info) {
+    if (out_info == nullptr) {
+        return false;
+    }
+    *out_info = {};
+    CUdevice device = 0;
+    char cuda_luid[8]{};
+    unsigned int node_mask = 0;
+    if (cuDeviceGet(&device, device_ordinal) != CUDA_SUCCESS
+        || cuDeviceGetLuid(cuda_luid, &node_mask, device) != CUDA_SUCCESS) {
+        return false;
+    }
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
+        return false;
+    }
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT index = 0; factory->EnumAdapters1(index, &adapter) != DXGI_ERROR_NOT_FOUND; ++index) {
+        DXGI_ADAPTER_DESC1 description{};
+        if (SUCCEEDED(adapter->GetDesc1(&description)) && memcmp(&description.AdapterLuid, cuda_luid, sizeof(cuda_luid)) == 0) {
+            break;
+        }
+        adapter->Release();
+        adapter = nullptr;
+    }
+    factory->Release();
+    if (adapter == nullptr) {
+        return false;
+    }
+    IDXGIAdapter3* adapter3 = nullptr;
+    const HRESULT query_result = adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&adapter3));
+    adapter->Release();
+    if (FAILED(query_result)) {
+        return false;
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+    DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal{};
+    const bool queried = SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))
+        && SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal));
+    adapter3->Release();
+    if (!queried) {
+        return false;
+    }
+    MEMORYSTATUSEX system_info{};
+    system_info.dwLength = sizeof(system_info);
+    if (!GlobalMemoryStatusEx(&system_info)) {
+        return false;
+    }
+    out_info->local_budget_bytes = local.Budget;
+    out_info->local_usage_bytes = local.CurrentUsage;
+    out_info->nonlocal_budget_bytes = nonlocal.Budget;
+    out_info->nonlocal_usage_bytes = nonlocal.CurrentUsage;
+    out_info->available_physical_bytes = system_info.ullAvailPhys;
+    out_info->available_commit_bytes = system_info.ullAvailPageFile;
+    return true;
+}
+#endif
+
+bool dxgi_budget_guard_allows_materialize(int device_ordinal) {
+    DxgiBudgetGuardConfig config{};
+    {
+        std::scoped_lock lock(dxgi_budget_guard_mutex);
+        for (const auto& [ordinal, candidate] : dxgi_budget_guards) {
+            if (ordinal == device_ordinal) {
+                config = candidate;
+                break;
+            }
+        }
+    }
+    if (
+        config.local_reserve_bytes == 0 && config.shared_reserve_bytes == 0
+        && config.system_reserve_bytes == 0
+    ) {
+        return true;
+    }
+#if defined(_WIN32)
+    ddo_vmm_windows_memory_info info{};
+    if (!query_windows_memory(device_ordinal, &info)) {
+        return true;
+    }
+    const auto retained_budget = [](uint64_t budget, uint64_t reserve) {
+        return budget > reserve ? budget - reserve : 0;
+    };
+    const bool local_safe = config.local_reserve_bytes == 0 || info.local_budget_bytes == 0
+        || info.local_usage_bytes <= retained_budget(info.local_budget_bytes, config.local_reserve_bytes);
+    const bool shared_safe = config.shared_reserve_bytes == 0 || info.nonlocal_budget_bytes == 0
+        || info.nonlocal_usage_bytes <= retained_budget(info.nonlocal_budget_bytes, config.shared_reserve_bytes);
+    const bool system_safe = config.system_reserve_bytes == 0
+        || (info.available_physical_bytes >= config.system_reserve_bytes
+            && info.available_commit_bytes >= config.system_reserve_bytes);
+    return local_safe && shared_safe && system_safe;
+#else
+    (void)device_ordinal;
+    return true;
+#endif
+}
 
 namespace {
 
@@ -308,7 +424,10 @@ extern "C" ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region) {
         return DDO_VMM_CUDA_ERROR;
     }
     CUmemGenericAllocationHandle allocation = 0;
-    while (cuMemCreate(&allocation, region->mapped_size, &properties, 0) != CUDA_SUCCESS) {
+    while (
+        !dxgi_budget_guard_allows_materialize(region->device_ordinal)
+        || cuMemCreate(&allocation, region->mapped_size, &properties, 0) != CUDA_SUCCESS
+    ) {
         allocation = 0;
         if (!ddo_vmm_pressure_evict_one(region->device_ordinal)) {
             set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
@@ -443,6 +562,51 @@ extern "C" int ddo_vmm_pressure_evict_one(int device_ordinal) {
     }
     selected->touch = ++pressure_clock;
     return 1;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_windows_memory_query(
+    int device_ordinal, ddo_vmm_windows_memory_info* out_info
+) {
+    if (device_ordinal < 0 || out_info == nullptr) {
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+#if defined(_WIN32)
+    if (!checked(cuInit(0), "cuInit")) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    if (query_windows_memory(device_ordinal, out_info)) {
+        return DDO_VMM_SUCCESS;
+    }
+    last_error = "unable to query DXGI memory budget for CUDA device";
+    return DDO_VMM_CUDA_ERROR;
+#else
+    (void)out_info;
+    last_error = "Windows DXGI memory budgets are unavailable on this platform";
+    return DDO_VMM_INVALID_ARGUMENT;
+#endif
+}
+
+extern "C" ddo_vmm_status ddo_vmm_dxgi_budget_guard_set(
+    int device_ordinal,
+    uint64_t local_reserve_bytes,
+    uint64_t shared_reserve_bytes,
+    uint64_t system_reserve_bytes
+) {
+    if (device_ordinal < 0) {
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    std::scoped_lock lock(dxgi_budget_guard_mutex);
+    for (auto& [ordinal, config] : dxgi_budget_guards) {
+        if (ordinal == device_ordinal) {
+            config = {local_reserve_bytes, shared_reserve_bytes, system_reserve_bytes};
+            return DDO_VMM_SUCCESS;
+        }
+    }
+    dxgi_budget_guards.push_back({
+        device_ordinal,
+        {local_reserve_bytes, shared_reserve_bytes, system_reserve_bytes},
+    });
+    return DDO_VMM_SUCCESS;
 }
 
 extern "C" const char* ddo_vmm_last_error(void) {

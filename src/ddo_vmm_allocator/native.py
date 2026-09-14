@@ -27,6 +27,29 @@ class NativeVmmRegionInfo:
     mapped_size: int
 
 
+@dataclass(frozen=True)
+class WindowsVideoMemoryInfo:
+    """Per-process WDDM budgets for the CUDA adapter currently in use."""
+
+    local_budget_bytes: int
+    local_usage_bytes: int
+    nonlocal_budget_bytes: int
+    nonlocal_usage_bytes: int
+    available_physical_bytes: int
+    available_commit_bytes: int
+
+
+class _WindowsVideoMemoryInfo(ctypes.Structure):
+    _fields_ = [
+        ("local_budget_bytes", ctypes.c_uint64),
+        ("local_usage_bytes", ctypes.c_uint64),
+        ("nonlocal_budget_bytes", ctypes.c_uint64),
+        ("nonlocal_usage_bytes", ctypes.c_uint64),
+        ("available_physical_bytes", ctypes.c_uint64),
+        ("available_commit_bytes", ctypes.c_uint64),
+    ]
+
+
 class NativeVmmLibrary:
     """Loaded C ABI VMM library with explicit region ownership."""
 
@@ -74,6 +97,18 @@ class NativeVmmLibrary:
         self._library.ddo_vmm_pressure_touch.restype = None
         self._library.ddo_vmm_pressure_evict_one.argtypes = [ctypes.c_int]
         self._library.ddo_vmm_pressure_evict_one.restype = ctypes.c_int
+        self._library.ddo_vmm_windows_memory_query.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(_WindowsVideoMemoryInfo),
+        ]
+        self._library.ddo_vmm_windows_memory_query.restype = ctypes.c_int
+        self._library.ddo_vmm_dxgi_budget_guard_set.argtypes = [
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        self._library.ddo_vmm_dxgi_budget_guard_set.restype = ctypes.c_int
         self._library.ddo_vmm_last_error.argtypes = []
         self._library.ddo_vmm_last_error.restype = ctypes.c_char_p
 
@@ -89,6 +124,44 @@ class NativeVmmLibrary:
 
     def pressure_evict_one(self, device_ordinal: int = 0) -> bool:
         return bool(self._library.ddo_vmm_pressure_evict_one(device_ordinal))
+
+    def windows_memory_info(self, device_ordinal: int = 0) -> WindowsVideoMemoryInfo:
+        """Return WDDM local/shared budgets associated with a CUDA device."""
+
+        info = _WindowsVideoMemoryInfo()
+        if self._library.ddo_vmm_windows_memory_query(device_ordinal, ctypes.byref(info)) != 0:
+            raise NativeVmmError(self._last_error())
+        return WindowsVideoMemoryInfo(
+            local_budget_bytes=int(info.local_budget_bytes),
+            local_usage_bytes=int(info.local_usage_bytes),
+            nonlocal_budget_bytes=int(info.nonlocal_budget_bytes),
+            nonlocal_usage_bytes=int(info.nonlocal_usage_bytes),
+            available_physical_bytes=int(info.available_physical_bytes),
+            available_commit_bytes=int(info.available_commit_bytes),
+        )
+
+    def set_dxgi_budget_guard(
+        self,
+        *,
+        device_ordinal: int = 0,
+        local_reserve_bytes: int = 0,
+        shared_reserve_bytes: int = 0,
+        system_reserve_bytes: int = 0,
+    ) -> None:
+        """Keep the requested memory reserve before materializing another VMM region.
+
+        A zero reserve disables the corresponding limit.  The native layer
+        evicts only registered, non-pinned regions while it tries to restore
+        these margins.
+        """
+
+        values = (local_reserve_bytes, shared_reserve_bytes, system_reserve_bytes)
+        if any(value < 0 for value in values):
+            raise ValueError("DXGI budget guard reserves must be non-negative")
+        if self._library.ddo_vmm_dxgi_budget_guard_set(
+            device_ordinal, *values
+        ) != 0:
+            raise NativeVmmError(self._last_error())
 
     def create_region(self, size_bytes: int, device_ordinal: int = 0, *, backing: str = "device") -> "NativeVmmRegion":
         if size_bytes <= 0:
