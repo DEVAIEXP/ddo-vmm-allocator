@@ -38,5 +38,23 @@ The VMM lifecycle is designed for CUDA on Windows and Linux.  Both platforms sup
 
 ## Development status
 
-Scaffold phase.  The present package defines the platform/capability boundary and does not yet install a PyTorch allocator.  That separation is deliberate: a Python-only package cannot safely replace PyTorch's native caching allocator.
+The portable C++ library now contains a first CUDA Driver VMM probe: it creates a device-local physical allocation, maps it into a reserved virtual address, grants access, writes through the mapping, and tears it down.  It still does not install a PyTorch allocator.  That separation is deliberate: a Python-only package cannot safely replace PyTorch's native caching allocator.
 
+## Windows build and probe
+
+Open the x64 MSVC developer prompt, then run:
+
+```powershell
+cd E:\ProjetosIA\diffusers-dynamic-offloader\ddo-vmm-allocator
+cmake -S . -B build -DDDO_VMM_BUILD_PROBES=ON
+cmake --build build --config Release
+.\build\Release\ddo_vmm_driver_probe.exe 64
+```
+
+If CMake selects a single-config generator such as Ninja, the probe path is instead:
+
+```powershell
+.\build\ddo_vmm_driver_probe.exe 64
+```
+
+The probe writes a known byte pattern through the mapped virtual address.  It is intentionally small and independent of PyTorch.
