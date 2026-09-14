@@ -219,6 +219,10 @@ class VmmModuleAdapter:
             def after(_module: Any, _args: tuple[Any, ...], _output: Any, *, group_name=block_name) -> Any:
                 nonlocal temporary_views
                 if temporary_views is not None:
+                    # A temporary tensor is not protected by the VMM arena.
+                    # Synchronize before restoring the stable parameter view so
+                    # no queued kernel can observe its storage being recycled.
+                    torch.cuda.current_stream(self.arena._device_ordinal).synchronize()
                     event = torch.cuda.Event(enable_timing=False)
                     event.record(torch.cuda.current_stream(self.arena._device_ordinal))
                     self._temporary_lifetimes.append((event, temporary_views))
