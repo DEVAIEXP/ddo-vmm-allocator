@@ -64,6 +64,10 @@ class VmmWeightArena:
     def resident_budget_bytes(self) -> int:
         return self._resident_budget_bytes
 
+    def has_group(self, name: str) -> bool:
+        """Return whether a named weight group has already been reserved."""
+        return name in self._groups
+
     @property
     def resident_bytes(self) -> int:
         return sum(
