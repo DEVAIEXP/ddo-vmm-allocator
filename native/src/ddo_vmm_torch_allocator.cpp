@@ -30,6 +30,48 @@ struct AllocationRecord {
     };
     size_t mapped_size = 0;
     int device_ordinal = -1;
+    cudaEvent_t completion_event = nullptr;
+
+    AllocationRecord() = default;
+    AllocationRecord(const AllocationRecord&) = delete;
+    AllocationRecord& operator=(const AllocationRecord&) = delete;
+
+    AllocationRecord(AllocationRecord&& other) noexcept
+        : region(std::move(other.region)),
+          mapped_size(other.mapped_size),
+          device_ordinal(other.device_ordinal),
+          completion_event(std::exchange(other.completion_event, nullptr)) {
+        other.mapped_size = 0;
+        other.device_ordinal = -1;
+    }
+
+    AllocationRecord& operator=(AllocationRecord&& other) noexcept {
+        if (this != &other) {
+            reset();
+            region = std::move(other.region);
+            mapped_size = other.mapped_size;
+            device_ordinal = other.device_ordinal;
+            completion_event = std::exchange(other.completion_event, nullptr);
+            other.mapped_size = 0;
+            other.device_ordinal = -1;
+        }
+        return *this;
+    }
+
+    ~AllocationRecord() { reset(); }
+
+    void reset() noexcept {
+        if (completion_event != nullptr) {
+            // A pointer may still be referenced by work on its freeing stream.
+            // Never unmap its VMM backing before that work has completed.
+            cudaEventSynchronize(completion_event);
+            cudaEventDestroy(completion_event);
+            completion_event = nullptr;
+        }
+        region.reset();
+        mapped_size = 0;
+        device_ordinal = -1;
+    }
 };
 
 std::mutex allocations_mutex;
@@ -73,8 +115,37 @@ size_t cache_limit_bytes() {
 
 void release_records(std::vector<AllocationRecord>& records) {
     for (AllocationRecord& record : records) {
-        record.region.reset();
+        record.reset();
     }
+}
+
+void record_stream_completion(AllocationRecord* record, cudaStream_t stream) {
+    if (record == nullptr || record->completion_event != nullptr) {
+        return;
+    }
+    cudaEvent_t event = nullptr;
+    if (
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess
+        && cudaEventRecord(event, stream) == cudaSuccess
+    ) {
+        record->completion_event = event;
+        return;
+    }
+    if (event != nullptr) {
+        cudaEventDestroy(event);
+    }
+    // If event setup failed, synchronize the freeing stream rather than
+    // risk releasing a virtual mapping that a queued kernel can still read.
+    cudaStreamSynchronize(stream);
+}
+
+void wait_for_stream_completion(AllocationRecord* record) {
+    if (record == nullptr || record->completion_event == nullptr) {
+        return;
+    }
+    cudaEventSynchronize(record->completion_event);
+    cudaEventDestroy(record->completion_event);
+    record->completion_event = nullptr;
 }
 
 bool take_cached_allocation(
@@ -143,6 +214,7 @@ extern "C" DDO_VMM_API void* ddo_vmm_torch_malloc(
         record.mapped_size = ddo_vmm_region_mapped_size(raw_region);
         record.device_ordinal = device_ordinal;
     }
+    wait_for_stream_completion(&record);
     const uintptr_t address = ddo_vmm_region_address(record.region.get());
     if (address == 0 || record.mapped_size == 0) {
         return nullptr;
@@ -168,7 +240,7 @@ extern "C" DDO_VMM_API void ddo_vmm_torch_free(
     void* pointer,
     size_t /*size_bytes*/,
     int /*device_ordinal*/,
-    cudaStream_t /*stream*/
+    cudaStream_t stream
 ) {
     if (pointer == nullptr) {
         return;
@@ -184,6 +256,8 @@ extern "C" DDO_VMM_API void ddo_vmm_torch_free(
         record = std::move(found->second);
         live_mapped_bytes -= record.mapped_size;
         allocations.erase(found);
+
+        record_stream_completion(&record, stream);
 
         const size_t cache_limit = cache_limit_bytes();
         if (cache_limit != 0 && record.mapped_size <= cache_limit) {
@@ -202,7 +276,7 @@ extern "C" DDO_VMM_API void ddo_vmm_torch_free(
         }
     }
     // Release outside the lock because CUDA Driver calls may block.
-    record.region.reset();
+    record.reset();
     release_records(evicted);
 }
 
