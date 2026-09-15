@@ -72,7 +72,6 @@ class VmmWeightArena:
         self._file_slices: Any | None = None
         self._staging_pool: Any | None = None
         self._registered_host: Any | None = None
-        self._managed_source: Any | None = None
         self._runtime_stats: dict[str, int] = {
             "materializations": 0,
             "lost_residency": 0,
@@ -82,8 +81,6 @@ class VmmWeightArena:
             "file_upload_bytes": 0,
             "cpu_uploads": 0,
             "cpu_upload_bytes": 0,
-            "managed_uploads": 0,
-            "managed_upload_bytes": 0,
             "evictions": 0,
             "temporary_groups": 0,
             "temporary_bytes": 0,
@@ -123,32 +120,6 @@ class VmmWeightArena:
         if self._groups:
             raise WeightArenaError("configure registered host transport before reserving weight groups")
         self._registered_host = registry
-    def configure_managed_source(self, managed_source: Any) -> None:
-        """Configure a persistent managed-memory source for packed groups.
-
-        The source object implements ``populate_group(name, weights)`` and
-        ``group_address(name)``. It stays separate from local VMM residency:
-        kernels still read local pages, while Windows can place the immutable
-        source model in its managed/shared budget.
-        """
-        self._managed_source = managed_source
-
-    def preload_managed_sources(self, names: list[str] | None = None) -> int:
-        """Populate managed sources incrementally and release duplicated CPU data."""
-        if self._managed_source is None:
-            raise WeightArenaError("no managed source is configured")
-        populated = 0
-        for name in names or list(self._groups):
-            group = self._group(name)
-            if not group.packed_sources:
-                continue
-            weights = [(weight_name, source) for weight_name, source, _ in group.packed_sources]
-            if not self._managed_source.populate_group(name, weights):
-                raise WeightArenaError(f"managed source budget cannot hold group {name!r}")
-            group.packed_payload_bytes = sum(source.numel() * source.element_size() for _, source in weights)
-            group.packed_sources.clear()
-            populated += 1
-        return populated
     def packed_source_groups(self) -> list[tuple[str, list[tuple[str, Any]]]]:
         """Return the immutable CPU source layout for each packed group."""
         return [
@@ -286,35 +257,6 @@ class VmmWeightArena:
 
         if group.payload_loaded:
             return
-        if self._managed_source is not None:
-            weights = [(weight_name, source) for weight_name, source, _ in group.packed_sources]
-            if self._managed_source.populate_group(group.name, weights):
-                try:
-                    from cuda.bindings import driver
-                except ImportError as error:
-                    raise WeightArenaError("managed source transfer requires cuda-python") from error
-                payload_bytes = group.packed_payload_bytes
-                if payload_bytes <= 0:
-                    raise WeightArenaError(f"managed source has no payload geometry for group {group.name!r}")
-                result = driver.cuMemcpyDtoDAsync(
-                    driver.CUdeviceptr(group.tensor_view.tensor.data_ptr()),
-                    driver.CUdeviceptr(self._managed_source.group_address(group.name)),
-                    payload_bytes,
-                    driver.CUstream(stream.cuda_stream),
-                )
-                if result[0] != driver.CUresult.CUDA_SUCCESS:
-                    raise WeightArenaError(f"managed source DMA failed for group {group.name!r}: {result[0]}")
-                import torch
-
-                event = torch.cuda.Event(enable_timing=False)
-                event.record(stream)
-                group.upload_event = event
-                group.payload_loaded = True
-                self._runtime_stats["uploads"] += 1
-                self._runtime_stats["upload_bytes"] += payload_bytes
-                self._runtime_stats["managed_uploads"] += 1
-                self._runtime_stats["managed_upload_bytes"] += payload_bytes
-                return
         if self._registered_host is not None and all(
             self._registered_host.contains(source) for _, source, _ in group.packed_sources
         ):
