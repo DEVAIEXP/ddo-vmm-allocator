@@ -28,6 +28,15 @@ class NativeVmmRegionInfo:
 
 
 @dataclass(frozen=True)
+class NativeModelArenaInfo:
+    address: int
+    virtual_size: int
+    page_size: int
+    resident_size: int
+    fault_ceiling: int
+
+
+@dataclass(frozen=True)
 class WindowsVideoMemoryInfo:
     """Per-process WDDM budgets for the CUDA adapter currently in use."""
 
@@ -77,6 +86,14 @@ class NativeVmmLibrary:
         self._library.ddo_vmm_region_evict.restype = ctypes.c_int
         self._library.ddo_vmm_region_materialize.argtypes = [ctypes.c_void_p]
         self._library.ddo_vmm_region_materialize.restype = ctypes.c_int
+        self._library.ddo_vmm_region_materialize_range.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        self._library.ddo_vmm_region_materialize_range.restype = ctypes.c_int
+        self._library.ddo_vmm_region_resident_size.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_region_resident_size.restype = ctypes.c_size_t
         self._library.ddo_vmm_region_address.argtypes = [ctypes.c_void_p]
         self._library.ddo_vmm_region_address.restype = ctypes.c_size_t
         self._library.ddo_vmm_region_requested_size.argtypes = [ctypes.c_void_p]
@@ -87,6 +104,52 @@ class NativeVmmLibrary:
         self._library.ddo_vmm_region_is_materialized.restype = ctypes.c_int
         self._library.ddo_vmm_device_granularity.argtypes = [ctypes.c_int]
         self._library.ddo_vmm_device_granularity.restype = ctypes.c_size_t
+        self._library.ddo_vmm_model_arena_create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.ddo_vmm_model_arena_create.restype = ctypes.c_int
+        self._library.ddo_vmm_model_arena_destroy.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_model_arena_destroy.restype = None
+        self._library.ddo_vmm_model_arena_fault_range.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        self._library.ddo_vmm_model_arena_fault_range.restype = ctypes.c_int
+        self._library.ddo_vmm_model_arena_copy_from_host.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p
+        ]
+        self._library.ddo_vmm_model_arena_copy_from_host.restype = ctypes.c_int
+        self._library.ddo_vmm_model_arena_copy_from_host_async.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self._library.ddo_vmm_model_arena_copy_from_host_async.restype = ctypes.c_int
+        self._library.ddo_vmm_model_arena_unpin_range.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        self._library.ddo_vmm_model_arena_unpin_range.restype = ctypes.c_int
+        self._library.ddo_vmm_model_arena_address.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_model_arena_address.restype = ctypes.c_size_t
+        self._library.ddo_vmm_model_arena_virtual_size.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_model_arena_virtual_size.restype = ctypes.c_size_t
+        self._library.ddo_vmm_model_arena_page_size.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_model_arena_page_size.restype = ctypes.c_size_t
+        self._library.ddo_vmm_model_arena_resident_size.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_model_arena_resident_size.restype = ctypes.c_size_t
+        self._library.ddo_vmm_model_arena_fault_ceiling.argtypes = [ctypes.c_void_p]
+        self._library.ddo_vmm_model_arena_fault_ceiling.restype = ctypes.c_size_t
         self._library.ddo_vmm_pressure_register.argtypes = [ctypes.c_void_p]
         self._library.ddo_vmm_pressure_register.restype = None
         self._library.ddo_vmm_pressure_unregister.argtypes = [ctypes.c_void_p]
@@ -176,6 +239,36 @@ class NativeVmmLibrary:
             raise NativeVmmError(self._last_error())
         return NativeVmmRegion(self, handle, backing=backing)
 
+    def create_model_arena(
+        self,
+        virtual_size_bytes: int,
+        *,
+        resident_budget_bytes: int | None = None,
+        page_size_bytes: int = 0,
+        device_ordinal: int = 0,
+        backing: str = "device",
+    ) -> "NativeModelArena":
+        if virtual_size_bytes <= 0:
+            raise ValueError("virtual_size_bytes must be positive")
+        if resident_budget_bytes is not None and resident_budget_bytes < 0:
+            raise ValueError("resident_budget_bytes must be non-negative")
+        if page_size_bytes < 0:
+            raise ValueError("page_size_bytes must be non-negative")
+        if backing not in {"device", "host"}:
+            raise ValueError("backing must be 'device' or 'host'")
+        handle = ctypes.c_void_p()
+        status = self._library.ddo_vmm_model_arena_create(
+            device_ordinal,
+            virtual_size_bytes,
+            0 if resident_budget_bytes is None else resident_budget_bytes,
+            page_size_bytes,
+            1 if backing == "host" else 0,
+            ctypes.byref(handle),
+        )
+        if status != 0 or not handle.value:
+            raise NativeVmmError(self._last_error())
+        return NativeModelArena(self, handle, backing=backing)
+
 
 class NativeVmmRegion:
     """A mapped CUDA VMM region that must be closed explicitly."""
@@ -206,6 +299,12 @@ class NativeVmmRegion:
             raise NativeVmmError("VMM region is closed")
         return bool(self._owner._library.ddo_vmm_region_is_materialized(self._handle))
 
+    @property
+    def resident_size(self) -> int:
+        if self._handle is None:
+            raise NativeVmmError("VMM region is closed")
+        return int(self._owner._library.ddo_vmm_region_resident_size(self._handle))
+
     def evict(self) -> None:
         """Unmap and release backing while retaining this object's virtual address."""
 
@@ -222,6 +321,18 @@ class NativeVmmRegion:
         if self._owner._library.ddo_vmm_region_materialize(self._handle) != 0:
             raise NativeVmmError(self._owner._last_error())
 
+    def materialize_range(self, offset_bytes: int, size_bytes: int) -> None:
+        """Map backing for one byte range inside the reserved virtual address."""
+
+        if self._handle is None:
+            raise NativeVmmError("VMM region is closed")
+        if offset_bytes < 0 or size_bytes <= 0:
+            raise ValueError("offset_bytes must be non-negative and size_bytes must be positive")
+        if self._owner._library.ddo_vmm_region_materialize_range(
+            self._handle, offset_bytes, size_bytes
+        ) != 0:
+            raise NativeVmmError(self._owner._last_error())
+
     def set_pressure_pinned(self, pinned: bool) -> None:
         if self._handle is None:
             raise NativeVmmError("VMM region is closed")
@@ -236,6 +347,93 @@ class NativeVmmRegion:
         if self._handle is not None:
             self._owner._library.ddo_vmm_pressure_unregister(self._handle)
             self._owner._library.ddo_vmm_region_destroy(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, _exception_type: object, _exception: object, _traceback: object) -> None:
+        self.close()
+
+
+class NativeModelArena:
+    """One model-sized CUDA virtual address arena with range faults."""
+
+    def __init__(self, owner: NativeVmmLibrary, handle: ctypes.c_void_p, *, backing: str = "device") -> None:
+        self._owner = owner
+        self._handle: ctypes.c_void_p | None = handle
+        self.backing = backing
+
+    @property
+    def closed(self) -> bool:
+        return self._handle is None
+
+    @property
+    def info(self) -> NativeModelArenaInfo:
+        if self._handle is None:
+            raise NativeVmmError("model arena is closed")
+        return NativeModelArenaInfo(
+            address=int(self._owner._library.ddo_vmm_model_arena_address(self._handle)),
+            virtual_size=int(self._owner._library.ddo_vmm_model_arena_virtual_size(self._handle)),
+            page_size=int(self._owner._library.ddo_vmm_model_arena_page_size(self._handle)),
+            resident_size=int(self._owner._library.ddo_vmm_model_arena_resident_size(self._handle)),
+            fault_ceiling=int(self._owner._library.ddo_vmm_model_arena_fault_ceiling(self._handle)),
+        )
+
+    def fault_range(self, offset_bytes: int, size_bytes: int) -> int:
+        """Materialize, pin, and return the range generation signature."""
+
+        if self._handle is None:
+            raise NativeVmmError("model arena is closed")
+        if offset_bytes < 0 or size_bytes <= 0:
+            raise ValueError("offset_bytes must be non-negative and size_bytes must be positive")
+        signature = ctypes.c_uint64()
+        if self._owner._library.ddo_vmm_model_arena_fault_range(
+            self._handle, offset_bytes, size_bytes, ctypes.byref(signature)
+        ) != 0:
+            raise NativeVmmError(self._owner._last_error())
+        return int(signature.value)
+
+    def unpin_range(self, offset_bytes: int, size_bytes: int) -> None:
+        """Release one pin acquired by fault_range."""
+
+        if self._handle is None:
+            raise NativeVmmError("model arena is closed")
+        if offset_bytes < 0 or size_bytes <= 0:
+            raise ValueError("offset_bytes must be non-negative and size_bytes must be positive")
+        if self._owner._library.ddo_vmm_model_arena_unpin_range(
+            self._handle, offset_bytes, size_bytes
+        ) != 0:
+            raise NativeVmmError(self._owner._last_error())
+
+    def copy_from_host(self, offset_bytes: int, source: Any) -> None:
+        if self._handle is None:
+            raise NativeVmmError("model arena is closed")
+        size_bytes = int(source.numel() * source.element_size())
+        if self._owner._library.ddo_vmm_model_arena_copy_from_host(
+            self._handle, offset_bytes, size_bytes, ctypes.c_void_p(int(source.data_ptr()))
+        ) != 0:
+            raise NativeVmmError(self._owner._last_error())
+
+    def copy_from_host_async(self, offset_bytes: int, source: Any, stream: Any = None) -> None:
+        if self._handle is None:
+            raise NativeVmmError("model arena is closed")
+        size_bytes = int(source.numel() * source.element_size())
+        stream_ptr = 0
+        if stream is not None:
+            stream_ptr = getattr(stream, "cuda_stream", stream)
+        if self._owner._library.ddo_vmm_model_arena_copy_from_host_async(
+            self._handle,
+            offset_bytes,
+            size_bytes,
+            ctypes.c_void_p(int(source.data_ptr())),
+            ctypes.c_void_p(int(stream_ptr)),
+        ) != 0:
+            raise NativeVmmError(self._owner._last_error())
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._owner._library.ddo_vmm_model_arena_destroy(self._handle)
             self._handle = None
 
     def __enter__(self) -> Self:

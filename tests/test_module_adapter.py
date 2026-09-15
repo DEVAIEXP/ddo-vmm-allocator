@@ -110,3 +110,4 @@ def test_host_backing_exposes_cuda_tensor_view() -> None:
         assert torch.equal(view.tensor[:16].cpu(), torch.full((16,), 7, dtype=torch.uint8))
     finally:
         region.close()
+

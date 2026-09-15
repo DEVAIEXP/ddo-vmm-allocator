@@ -21,6 +21,7 @@ def attach_transformer_blocks(
     arena: VmmWeightArena,
     *,
     module_pattern: str = r"transformer_blocks\.\d+$",
+    recursive: bool = True,
 ) -> TransformerAttachReport:
     """Attach matching transformer blocks to an explicit VMM arena.
 
@@ -29,7 +30,7 @@ def attach_transformer_blocks(
     not install a global PyTorch allocator or remove existing Diffusers hooks.
     """
     adapter = VmmModuleAdapter(arena)
-    names = adapter.attach_module_tree(transformer, module_pattern)
+    names = adapter.attach_module_tree(transformer, module_pattern, recursive=recursive)
     return TransformerAttachReport(
         pattern=module_pattern,
         attached_groups=len(names),

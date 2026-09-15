@@ -71,6 +71,7 @@ class VmmWeightArena:
         self._lru: OrderedDict[str, None] = OrderedDict()
         self._file_slices: Any | None = None
         self._staging_pool: Any | None = None
+        self._registered_host: Any | None = None
         self._managed_source: Any | None = None
         self._runtime_stats: dict[str, int] = {
             "materializations": 0,
@@ -101,7 +102,7 @@ class VmmWeightArena:
         result = dict(self._runtime_stats)
         result["resident_bytes"] = self.resident_bytes
         result["resident_groups"] = sum(
-            group.region.materialized for group in self._groups.values()
+            group.region.resident_size > 0 for group in self._groups.values()
         )
         return result
     def configure_file_transport(self, file_slices: Any, staging_pool: Any) -> None:
@@ -116,6 +117,12 @@ class VmmWeightArena:
             raise WeightArenaError("configure file transport before reserving weight groups")
         self._file_slices = file_slices
         self._staging_pool = staging_pool
+
+    def configure_registered_host_transport(self, registry: Any) -> None:
+        """Use an existing host-registration registry for direct H2D uploads."""
+        if self._groups:
+            raise WeightArenaError("configure registered host transport before reserving weight groups")
+        self._registered_host = registry
     def configure_managed_source(self, managed_source: Any) -> None:
         """Configure a persistent managed-memory source for packed groups.
 
@@ -159,9 +166,9 @@ class VmmWeightArena:
     @property
     def resident_bytes(self) -> int:
         return sum(
-            group.region.info.mapped_size
+            group.region.resident_size
             for group in self._groups.values()
-            if group.region.materialized
+            if group.region.resident_size
         )
 
     def reserve(self, name: str, size_bytes: int) -> WeightGroupView:
@@ -248,6 +255,8 @@ class VmmWeightArena:
             if not isinstance(source, torch.Tensor) or source.device.type != "cpu":
                 raise TypeError("packed VMM sources must be CPU torch tensors")
             source = source.detach().contiguous()
+            if self._registered_host is not None:
+                self._registered_host.register(source)
             size_bytes = source.numel() * source.element_size()
             if self._pin_source and not source.is_pinned():
                 if self._pin_source_budget_bytes is None or self._pinned_source_bytes + size_bytes <= self._pin_source_budget_bytes:
@@ -257,14 +266,15 @@ class VmmWeightArena:
             offset += size_bytes
         if offset > group.region.info.mapped_size:
             raise WeightArenaError(f"packed CPU tensors do not fit in VMM group {name!r}")
+        total_payload_bytes = offset
         self.materialize(name)
         group.tensor_view = PersistentVmmTensorView.create(group.region)
         group.packed_views = {}
-        for weight_name, source, offset in normalized:
+        for weight_name, source, source_offset in normalized:
             byte_count = source.numel() * source.element_size()
-            group.packed_views[weight_name] = group.tensor_view.tensor.narrow(0, offset, byte_count).view(source.dtype).reshape(source.shape)
+            group.packed_views[weight_name] = group.tensor_view.tensor.narrow(0, source_offset, byte_count).view(source.dtype).reshape(source.shape)
         group.packed_sources = normalized
-        group.packed_payload_bytes = offset
+        group.packed_payload_bytes = total_payload_bytes
         group.payload_loaded = False
         if group.pin_count == 0:
             self._evict(group)
@@ -305,6 +315,31 @@ class VmmWeightArena:
                 self._runtime_stats["managed_uploads"] += 1
                 self._runtime_stats["managed_upload_bytes"] += payload_bytes
                 return
+        if self._registered_host is not None and all(
+            self._registered_host.contains(source) for _, source, _ in group.packed_sources
+        ):
+            try:
+                from cuda.bindings import driver
+            except ImportError as error:
+                raise WeightArenaError("registered host transport requires cuda-python") from error
+            for _weight_name, source, offset in group.packed_sources:
+                result = driver.cuMemcpyHtoDAsync(
+                    driver.CUdeviceptr(group.tensor_view.tensor.data_ptr() + offset),
+                    source.data_ptr(),
+                    source.numel() * source.element_size(),
+                    driver.CUstream(stream.cuda_stream),
+                )
+                if result[0] != driver.CUresult.CUDA_SUCCESS:
+                    raise WeightArenaError(f"registered host VMM upload failed for group {group.name!r}: {result[0]}")
+            event = torch.cuda.Event(enable_timing=False)
+            event.record(stream)
+            group.upload_event = event
+            group.payload_loaded = True
+            self._runtime_stats["uploads"] += 1
+            self._runtime_stats["upload_bytes"] += group.packed_payload_bytes
+            self._runtime_stats["cpu_uploads"] += 1
+            self._runtime_stats["cpu_upload_bytes"] += group.packed_payload_bytes
+            return
         if self._file_slices is not None and self._staging_pool is not None:
             entries = [(source, self._file_slices.lookup(source)) for _, source, _ in group.packed_sources]
             if entries and all(file_slice is not None for _, file_slice in entries):
@@ -313,13 +348,32 @@ class VmmWeightArena:
                 expected_bytes = sum(source.numel() * source.element_size() for _, source, _ in group.packed_sources)
                 if staged_bytes != expected_bytes:
                     raise WeightArenaError(f"checkpoint slice payload mismatch for VMM group {group.name!r}")
-                with torch.cuda.stream(stream):
-                    group.tensor_view.tensor.narrow(0, 0, staged_bytes).copy_(
-                        self._staging_pool.packed_bytes,
-                        non_blocking=True,
+                if self._staging_pool.uses_registered_virtual_host:
+                    # The staging pool owns a bounded VirtualAlloc region
+                    # registered once with CUDA.  Copy directly from that
+                    # stable host address into device-backed VMM pages so the
+                    # pageable checkpoint tensor is never copied into a
+                    # second pinned model-sized buffer.
+                    try:
+                        from cuda.bindings import driver
+                    except ImportError as error:
+                        raise WeightArenaError("registered host transport requires cuda-python") from error
+                    result = driver.cuMemcpyHtoDAsync(
+                        driver.CUdeviceptr(group.tensor_view.tensor.data_ptr()),
+                        self._staging_pool.packed_bytes.data_ptr(),
+                        staged_bytes,
+                        driver.CUstream(stream.cuda_stream),
                     )
-                    event = torch.cuda.Event(enable_timing=False)
-                    event.record(stream)
+                    if result[0] != driver.CUresult.CUDA_SUCCESS:
+                        raise WeightArenaError(f"registered host VMM upload failed for group {group.name!r}: {result[0]}")
+                else:
+                    with torch.cuda.stream(stream):
+                        group.tensor_view.tensor.narrow(0, 0, staged_bytes).copy_(
+                            self._staging_pool.packed_bytes,
+                            non_blocking=True,
+                        )
+                event = torch.cuda.Event(enable_timing=False)
+                event.record(stream)
                 self._staging_pool.mark_upload(event)
                 group.upload_event = event
                 group.payload_loaded = True
@@ -328,6 +382,41 @@ class VmmWeightArena:
                 self._runtime_stats["file_uploads"] += 1
                 self._runtime_stats["file_upload_bytes"] += staged_bytes
                 return
+        if self._staging_pool is not None:
+            self._staging_pool.begin_upload()
+            for _weight_name, source, offset in group.packed_sources:
+                self._staging_pool.stage(source)
+            staged_bytes = group.packed_payload_bytes
+
+            if self._staging_pool.uses_registered_virtual_host:
+                try:
+                    from cuda.bindings import driver
+                except ImportError as error:
+                    raise WeightArenaError("registered host transport requires cuda-python") from error
+                result = driver.cuMemcpyHtoDAsync(
+                    driver.CUdeviceptr(group.tensor_view.tensor.data_ptr()),
+                    self._staging_pool.packed_bytes.data_ptr(),
+                    staged_bytes,
+                    driver.CUstream(stream.cuda_stream),
+                )
+                if result[0] != driver.CUresult.CUDA_SUCCESS:
+                    raise WeightArenaError(f"staging VMM upload failed for group {group.name!r}: {result[0]}")
+            else:
+                with torch.cuda.stream(stream):
+                    group.tensor_view.tensor.narrow(0, 0, staged_bytes).copy_(
+                        self._staging_pool.packed_bytes,
+                        non_blocking=True,
+                    )
+            event = torch.cuda.Event(enable_timing=False)
+            event.record(stream)
+            self._staging_pool.mark_upload(event)
+            group.upload_event = event
+            group.payload_loaded = True
+            self._runtime_stats["uploads"] += 1
+            self._runtime_stats["upload_bytes"] += staged_bytes
+            return
+
+        # Fallback staging pool
         with torch.cuda.stream(stream):
             for _weight_name, source, offset in group.packed_sources:
                 byte_count = source.numel() * source.element_size()
@@ -335,6 +424,7 @@ class VmmWeightArena:
                 destination.copy_(source, non_blocking=source.is_pinned())
             event = torch.cuda.Event(enable_timing=False)
             event.record(stream)
+            
         group.upload_event = event
         group.payload_loaded = True
         self._runtime_stats["uploads"] += 1
@@ -347,7 +437,7 @@ class VmmWeightArena:
         group = self._group(name)
         if not group.packed_sources or group.tensor_view is None:
             raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
-        self.pin(name)
+        self._pin_payload_range(group, group.packed_payload_bytes)
         if not group.payload_loaded:
             import torch
 
@@ -395,9 +485,9 @@ class VmmWeightArena:
             # stable view.  Do not increment an existing look-ahead pin: that
             # pin already belongs to this forthcoming consumer.
             if group.pin_count == 0:
-                self.pin(name)
+                self._pin_payload_range(group, group.packed_payload_bytes)
             return
-        self.pin(name)
+        self._pin_payload_range(group, group.packed_payload_bytes)
         self._upload_packed_group(group, stream)
     def wait_for_prefetch_group(self, name: str) -> dict[str, Any]:
         group = self._group(name)
@@ -415,7 +505,7 @@ class VmmWeightArena:
         group = self._group(name)
         if group.source_tensor is None or group.tensor_view is None:
             raise WeightArenaError(f"weight group has no bound CPU tensor: {name}")
-        self.pin(name)
+        self._pin_payload_range(group, group.source_tensor.numel() * group.source_tensor.element_size())
         if group.upload_event is not None:
             torch.cuda.current_stream(self._device_ordinal).wait_event(group.upload_event)
             group.upload_event = None
@@ -436,7 +526,7 @@ class VmmWeightArena:
             raise WeightArenaError(f"weight group has no bound CPU tensor: {name}")
         import torch
 
-        self.pin(name)
+        self._pin_payload_range(group, group.source_tensor.numel() * group.source_tensor.element_size())
         if group.payload_loaded:
             return
         source = group.source_tensor
@@ -547,6 +637,32 @@ class VmmWeightArena:
         self._touch(name)
         return self.view(name)
 
+    def materialize_range(self, name: str, offset_bytes: int, size_bytes: int) -> WeightGroupView:
+        """Materialize only the physical pages covering a payload byte range."""
+
+        if offset_bytes < 0 or size_bytes <= 0:
+            raise ValueError("offset_bytes must be non-negative and size_bytes must be positive")
+        group = self._group(name)
+        info = group.region.info
+        if offset_bytes > info.mapped_size or size_bytes > info.mapped_size - offset_bytes:
+            raise WeightArenaError(f"range does not fit in VMM group {name!r}")
+        resident_before = group.region.resident_size
+        if resident_before == 0:
+            group.payload_loaded = False
+            group.upload_event = None
+        granularity = self._library.device_granularity(self._device_ordinal)
+        aligned_offset = (offset_bytes // granularity) * granularity
+        aligned_end = ((offset_bytes + size_bytes + granularity - 1) // granularity) * granularity
+        additional_bytes = aligned_end - aligned_offset
+        self._make_room_for_bytes(additional_bytes, protected_name=name)
+        group.region.materialize_range(offset_bytes, size_bytes)
+        if group.region.resident_size > resident_before:
+            self._runtime_stats["materializations"] += 1
+            if resident_before == 0:
+                self._runtime_stats["lost_residency"] += 1
+        self._touch(name)
+        return self.view(name)
+
     def pin(self, name: str) -> WeightGroupView:
         group = self._group(name)
         self.materialize(name)
@@ -554,6 +670,15 @@ class VmmWeightArena:
         group.region.set_pressure_pinned(True)
         self._touch(name)
         return self.view(name)
+
+    def _pin_payload_range(self, group: _WeightGroup, payload_bytes: int) -> WeightGroupView:
+        if payload_bytes <= 0:
+            raise WeightArenaError(f"weight group has no payload geometry: {group.name}")
+        self.materialize_range(group.name, 0, payload_bytes)
+        group.pin_count += 1
+        group.region.set_pressure_pinned(True)
+        self._touch(group.name)
+        return self.view(group.name)
 
     def unpin(self, name: str) -> WeightGroupView:
         group = self._group(name)
@@ -590,9 +715,9 @@ class VmmWeightArena:
             if self.resident_bytes <= keep_bytes:
                 break
             group = self._groups[name]
-            if group.pin_count != 0 or not group.region.materialized:
+            if group.pin_count != 0 or group.region.resident_size == 0:
                 continue
-            evicted_bytes += group.region.info.mapped_size
+            evicted_bytes += group.region.resident_size
             self._evict(group)
         return evicted_bytes
 
@@ -615,9 +740,14 @@ class VmmWeightArena:
             # reports pressure.  No Python-side limit is imposed here.
             return
         required_bytes = group.region.info.mapped_size
+        self._make_room_for_bytes(required_bytes, protected_name=protected_name)
+
+    def _make_room_for_bytes(self, required_bytes: int, *, protected_name: str) -> None:
+        if required_bytes <= 0 or self._resident_budget_bytes is None:
+            return
         if required_bytes > self._resident_budget_bytes:
             raise WeightArenaError(
-                f"weight group {group.name!r} requires {required_bytes} bytes, exceeding resident budget"
+                f"weight group {protected_name!r} requires {required_bytes} bytes, exceeding resident budget"
             )
         while self.resident_bytes + required_bytes > self._resident_budget_bytes:
             evicted = False
@@ -625,7 +755,7 @@ class VmmWeightArena:
                 if name == protected_name:
                     continue
                 candidate = self._groups[name]
-                if candidate.pin_count != 0 or not candidate.region.materialized:
+                if candidate.pin_count != 0 or candidate.region.resident_size == 0:
                     continue
                 self._evict(candidate)
                 evicted = True

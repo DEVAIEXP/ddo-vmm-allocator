@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 typedef struct ddo_vmm_region ddo_vmm_region;
+typedef struct ddo_vmm_model_arena ddo_vmm_model_arena;
 
 typedef enum ddo_vmm_status {
     DDO_VMM_SUCCESS = 0,
@@ -69,11 +70,84 @@ DDO_VMM_API ddo_vmm_status ddo_vmm_region_evict(ddo_vmm_region* region);
 /** Recreate device-local backing and map it at the region's original virtual address. */
 DDO_VMM_API ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region);
 
+/**
+ * Recreate backing for a byte range inside the reserved virtual address.
+ *
+ * `offset_bytes` and `size_bytes` are rounded outward to CUDA's VMM
+ * allocation granularity.  The returned resident-byte accounting therefore
+ * may be larger than the requested payload range.
+ */
+DDO_VMM_API ddo_vmm_status ddo_vmm_region_materialize_range(
+    ddo_vmm_region* region,
+    size_t offset_bytes,
+    size_t size_bytes
+);
+
+/** Return resident physical bytes currently mapped into this virtual region. */
+DDO_VMM_API size_t ddo_vmm_region_resident_size(const ddo_vmm_region* region);
+
 DDO_VMM_API uintptr_t ddo_vmm_region_address(const ddo_vmm_region* region);
 DDO_VMM_API size_t ddo_vmm_region_requested_size(const ddo_vmm_region* region);
 DDO_VMM_API size_t ddo_vmm_region_mapped_size(const ddo_vmm_region* region);
 DDO_VMM_API int ddo_vmm_region_is_materialized(const ddo_vmm_region* region);
 DDO_VMM_API size_t ddo_vmm_device_granularity(int device_ordinal);
+
+/**
+ * Reserve one stable virtual address span for a complete model-weight address
+ * space. Physical pages are not committed until ddo_vmm_model_arena_fault_range().
+ *
+ * resident_budget_bytes == 0 lets the CUDA driver/WDDM decide residency until
+ * allocation pressure is reported by cuMemCreate. page_size_bytes == 0 uses
+ * the CUDA minimum VMM allocation granularity for the selected backing kind.
+ */
+DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_create(
+    int device_ordinal,
+    size_t virtual_size_bytes,
+    size_t resident_budget_bytes,
+    size_t page_size_bytes,
+    ddo_vmm_backing_kind backing_kind,
+    ddo_vmm_model_arena** out_arena
+);
+
+DDO_VMM_API void ddo_vmm_model_arena_destroy(ddo_vmm_model_arena* arena);
+
+/**
+ * Materialize and pin the pages covering a byte range. out_signature receives
+ * a stable content-generation signature for the current resident pages. If the
+ * same range faults again without any page being recycled, the signature stays
+ * unchanged and callers can skip copying immutable source bytes.
+ */
+DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_fault_range(
+    ddo_vmm_model_arena* arena,
+    size_t offset_bytes,
+    size_t size_bytes,
+    uint64_t* out_signature
+);
+DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_copy_from_host(
+    ddo_vmm_model_arena* arena,
+    size_t offset_bytes,
+    size_t size_bytes,
+    const void* host_ptr
+);
+DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_copy_from_host_async(
+    ddo_vmm_model_arena* arena,
+    size_t offset_bytes,
+    size_t size_bytes,
+    const void* host_ptr,
+    void* cuda_stream
+);
+/** Release one pin acquired by fault_range for each page covering the range. */
+DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_unpin_range(
+    ddo_vmm_model_arena* arena,
+    size_t offset_bytes,
+    size_t size_bytes
+);
+
+DDO_VMM_API uintptr_t ddo_vmm_model_arena_address(const ddo_vmm_model_arena* arena);
+DDO_VMM_API size_t ddo_vmm_model_arena_virtual_size(const ddo_vmm_model_arena* arena);
+DDO_VMM_API size_t ddo_vmm_model_arena_page_size(const ddo_vmm_model_arena* arena);
+DDO_VMM_API size_t ddo_vmm_model_arena_resident_size(const ddo_vmm_model_arena* arena);
+DDO_VMM_API size_t ddo_vmm_model_arena_fault_ceiling(const ddo_vmm_model_arena* arena);
 
 /** Register model-weight regions that may be evicted under allocator pressure. */
 DDO_VMM_API void ddo_vmm_pressure_register(ddo_vmm_region* region);

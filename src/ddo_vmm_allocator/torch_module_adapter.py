@@ -131,7 +131,7 @@ class VmmModuleAdapter:
         self._handles.append(module.register_forward_hook(after))
         return [binding.group_name for binding in bindings]
 
-    def attach_module_tree(self, root: Any, module_pattern: str) -> list[str]:
+    def attach_module_tree(self, root: Any, module_pattern: str, *, recursive: bool = True) -> list[str]:
         """Attach matching blocks as packed VMM execution groups.
 
         Each matching block gets one stable virtual region containing all of its
@@ -145,14 +145,14 @@ class VmmModuleAdapter:
         pattern = re.compile(module_pattern)
         attached_ids: set[int] = set()
         group_names: list[str] = []
-        block_entries: list[str] = []
+        all_block_names: list[str] = []
         copy_stream = torch.cuda.Stream()
         for block_name, block in root.named_modules():
             if not block_name or not pattern.search(block_name):
                 continue
             entries: list[tuple[str, Any, str, Any]] = []
             packed_sources: list[tuple[str, Any]] = []
-            for relative_name, parameter in block.named_parameters(recurse=True):
+            for relative_name, parameter in block.named_parameters(recurse=recursive):
                 if id(parameter) in attached_ids:
                     continue
                 owner = block
@@ -183,8 +183,8 @@ class VmmModuleAdapter:
             # argument.  Loop-created closures must never share the temporary
             # storage or parameter list of the last attached block.
             hook_state: dict[str, Any] = {"temporary_views": None}
-            block_index = len(block_entries)
-            block_entries.append(block_name)
+            block_index = len(all_block_names)
+            all_block_names.append(block_name)
             group_names.append(block_name)
 
             def before(
@@ -193,8 +193,9 @@ class VmmModuleAdapter:
                 *,
                 group_name=block_name,
                 group_index=block_index,
-                block_entries=entries,
+                module_entries=entries,
                 block_state=hook_state,
+                all_blocks=all_block_names,
             ) -> None:
                 self._collect_temporary_lifetimes()
                 self.arena.collect_completed_events()
@@ -214,13 +215,13 @@ class VmmModuleAdapter:
                         # CUDA temporary, then release it after the hook.
                         temporary_views = self.arena.temporary_loaded_group(group_name)
                         block_state["temporary_views"] = temporary_views
-                        for relative_name, owner, parameter_name, _source in block_entries:
+                        for relative_name, owner, parameter_name, _source in module_entries:
                             owner._parameters[parameter_name].data = temporary_views[relative_name]
                 else:
                     next_index = group_index + 1
-                    if next_index < len(block_entries):
+                    if next_index < len(all_blocks):
                         try:
-                            self.arena.prefetch_loaded_group(block_entries[next_index], copy_stream)
+                            self.arena.prefetch_loaded_group(all_blocks[next_index], copy_stream)
                         except (WeightArenaError, NativeVmmError):
                             # Look-ahead is optional.  A sub-page resident
                             # budget may fit one rounded block but not two.
@@ -233,7 +234,7 @@ class VmmModuleAdapter:
                 _output: Any,
                 *,
                 group_name=block_name,
-                block_entries=entries,
+                module_entries=entries,
                 block_state=hook_state,
                 block_stable_data=stable_data,
             ) -> Any:
@@ -246,7 +247,7 @@ class VmmModuleAdapter:
                     event = torch.cuda.Event(enable_timing=False)
                     event.record(torch.cuda.current_stream(self.arena._device_ordinal))
                     self._temporary_lifetimes.append((event, temporary_views))
-                    for relative_name, owner, parameter_name, _source in block_entries:
+                    for relative_name, owner, parameter_name, _source in module_entries:
                         owner._parameters[parameter_name].data = block_stable_data[relative_name]
                     block_state["temporary_views"] = None
                 else:
