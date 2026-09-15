@@ -112,6 +112,8 @@ struct ddo_vmm_model_arena {
     size_t resident_budget = 0;
     size_t resident_pages = 0;
     size_t fault_ceiling_page = 0;
+    const char* admission_limit_reason = "resident capacity";
+    CUmemGenericAllocationHandle view_bootstrap_allocation = 0;
     CUcontext retained_primary_context = nullptr;
     ddo_vmm_backing_kind backing_kind = DDO_VMM_BACKING_DEVICE;
 
@@ -120,6 +122,7 @@ struct ddo_vmm_model_arena {
         uint32_t pin_count = 0;
         uint64_t generation = 0;
         uint64_t last_touch = 0;
+        bool view_bootstrap_mapped = false;
     };
     std::vector<Page> pages;
 };
@@ -215,7 +218,12 @@ bool query_windows_memory(int device_ordinal, ddo_vmm_windows_memory_info* out_i
 }
 #endif
 
-bool dxgi_budget_guard_allows_materialize(int device_ordinal, size_t required_bytes, ddo_vmm_backing_kind backing_kind) {
+bool dxgi_budget_guard_allows_materialize(
+    int device_ordinal,
+    size_t required_bytes,
+    ddo_vmm_backing_kind backing_kind,
+    bool allow_wddm_fallback = false
+) {
     DxgiBudgetGuardConfig config{};
     {
         std::scoped_lock lock(dxgi_budget_guard_mutex);
@@ -249,7 +257,10 @@ bool dxgi_budget_guard_allows_materialize(int device_ordinal, size_t required_by
     // not reject them merely because the local budget is smaller than the
     // model.  HOST backing, when explicitly requested, is checked against the
     // shared budget directly.
-    const bool local_safe = info.local_budget_bytes == 0
+    // The model-address arena explicitly delegates physical placement to
+    // WDDM. Rejecting it at the local budget would prevent non-local backing.
+    // Other VMM regions retain the conservative local-budget guard.
+    const bool local_safe = allow_wddm_fallback || info.local_budget_bytes == 0
         || (info.local_usage_bytes <= local_limit && required <= local_limit - info.local_usage_bytes);
     const bool shared_safe = backing_kind != DDO_VMM_BACKING_HOST || info.nonlocal_budget_bytes == 0
         || (info.nonlocal_usage_bytes <= shared_limit && required <= shared_limit - info.nonlocal_usage_bytes);
@@ -263,8 +274,15 @@ bool dxgi_budget_guard_allows_materialize(int device_ordinal, size_t required_by
 #endif
 }
 
-bool make_dxgi_budget_room(int device_ordinal, size_t required_bytes, ddo_vmm_backing_kind backing_kind) {
-    while (!dxgi_budget_guard_allows_materialize(device_ordinal, required_bytes, backing_kind)) {
+bool make_dxgi_budget_room(
+    int device_ordinal,
+    size_t required_bytes,
+    ddo_vmm_backing_kind backing_kind,
+    bool allow_wddm_fallback = false
+) {
+    while (!dxgi_budget_guard_allows_materialize(
+        device_ordinal, required_bytes, backing_kind, allow_wddm_fallback
+    )) {
         if (!ddo_vmm_pressure_evict_one(device_ordinal)) {
             return false;
         }
@@ -373,17 +391,23 @@ bool model_arena_evict_one(
     return release_model_arena_page(arena, selected);
 }
 
-bool model_arena_make_room(ddo_vmm_model_arena* arena, size_t protected_begin, size_t protected_end) {
-    if (arena->resident_budget == 0) {
+void model_arena_limit_admission(
+    ddo_vmm_model_arena* arena,
+    size_t page_index,
+    const char* reason
+) {
+    if (arena != nullptr) {
+        arena->fault_ceiling_page = std::min(arena->fault_ceiling_page, page_index);
+        arena->admission_limit_reason = reason;
+    }
+}
+
+bool model_arena_can_admit_page(const ddo_vmm_model_arena* arena) {
+    if (arena == nullptr || arena->resident_budget == 0) {
         return true;
     }
     const size_t budget_pages = std::max<size_t>(1, arena->resident_budget / arena->page_size);
-    while (arena->resident_pages >= budget_pages) {
-        if (!model_arena_evict_one(arena, protected_begin, protected_end)) {
-            return false;
-        }
-    }
-    return true;
+    return arena->resident_pages < budget_pages;
 }
 
 size_t region_resident_size(const ddo_vmm_region* region) {
@@ -961,7 +985,16 @@ extern "C" void ddo_vmm_model_arena_destroy(ddo_vmm_model_arena* arena) {
         CUcontext temporary_primary_context = nullptr;
         if (activate_model_arena_context(arena, &temporary_primary_context)) {
             for (size_t page_index = 0; page_index < arena->pages.size(); ++page_index) {
+                auto& page = arena->pages[page_index];
+                if (page.view_bootstrap_mapped) {
+                    cuMemUnmap(arena->address + page_index * arena->page_size, arena->page_size);
+                    page.view_bootstrap_mapped = false;
+                }
                 release_model_arena_page(arena, page_index);
+            }
+            if (arena->view_bootstrap_allocation != 0) {
+                cuMemRelease(arena->view_bootstrap_allocation);
+                arena->view_bootstrap_allocation = 0;
             }
             if (arena->address != 0 && arena->virtual_size != 0) {
                 cuMemAddressFree(arena->address, arena->virtual_size);
@@ -974,6 +1007,103 @@ extern "C" void ddo_vmm_model_arena_destroy(ddo_vmm_model_arena* arena) {
         }
     }
     delete arena;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_model_arena_prepare_view_range(
+    ddo_vmm_model_arena* arena,
+    size_t offset_bytes,
+    size_t size_bytes
+) {
+    if (arena == nullptr || size_bytes == 0 || offset_bytes > arena->virtual_size
+        || size_bytes > arena->virtual_size - offset_bytes) {
+        last_error = "model arena view range is invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    const size_t begin_page = model_arena_page_begin(arena, offset_bytes);
+    const size_t end_page = model_arena_page_end(arena, offset_bytes, size_bytes);
+    if (begin_page >= end_page || end_page > arena->pages.size()) {
+        last_error = "model arena view page range is invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    if (!checked(cuInit(0), "cuInit")) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    CUcontext temporary_primary_context = nullptr;
+    if (!activate_model_arena_context(arena, &temporary_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    CUdevice device = 0;
+    CUmemAllocationProp properties{};
+    if (!device_properties(arena->device_ordinal, arena->backing_kind, &device, &properties)) {
+        release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    if (arena->view_bootstrap_allocation == 0
+        && !checked(cuMemCreate(&arena->view_bootstrap_allocation, arena->page_size, &properties, 0), "cuMemCreate")) {
+        release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    std::vector<size_t> mapped_pages;
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = arena->device_ordinal;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    for (size_t page_index = begin_page; page_index < end_page; ++page_index) {
+        auto& page = arena->pages[page_index];
+        if (page.allocation != 0 || page.view_bootstrap_mapped) {
+            continue;
+        }
+        const CUdeviceptr page_address = arena->address + page_index * arena->page_size;
+        if (cuMemMap(page_address, arena->page_size, 0, arena->view_bootstrap_allocation, 0) != CUDA_SUCCESS
+            || cuMemSetAccess(page_address, arena->page_size, &access, 1) != CUDA_SUCCESS) {
+            for (const size_t mapped_index : mapped_pages) {
+                cuMemUnmap(arena->address + mapped_index * arena->page_size, arena->page_size);
+                arena->pages[mapped_index].view_bootstrap_mapped = false;
+            }
+            last_error = "unable to map transient model arena view backing";
+            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+            return DDO_VMM_CUDA_ERROR;
+        }
+        page.view_bootstrap_mapped = true;
+        mapped_pages.push_back(page_index);
+    }
+    release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_model_arena_release_view_range(
+    ddo_vmm_model_arena* arena,
+    size_t offset_bytes,
+    size_t size_bytes
+) {
+    if (arena == nullptr || size_bytes == 0 || offset_bytes > arena->virtual_size
+        || size_bytes > arena->virtual_size - offset_bytes) {
+        last_error = "model arena view range is invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    const size_t begin_page = model_arena_page_begin(arena, offset_bytes);
+    const size_t end_page = model_arena_page_end(arena, offset_bytes, size_bytes);
+    if (begin_page >= end_page || end_page > arena->pages.size()) {
+        last_error = "model arena view page range is invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    CUcontext temporary_primary_context = nullptr;
+    if (!activate_model_arena_context(arena, &temporary_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    for (size_t page_index = begin_page; page_index < end_page; ++page_index) {
+        auto& page = arena->pages[page_index];
+        if (!page.view_bootstrap_mapped) {
+            continue;
+        }
+        if (!checked(cuMemUnmap(arena->address + page_index * arena->page_size, arena->page_size), "cuMemUnmap")) {
+            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+            return DDO_VMM_CUDA_ERROR;
+        }
+        page.view_bootstrap_mapped = false;
+    }
+    release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+    return DDO_VMM_SUCCESS;
 }
 
 extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
@@ -997,6 +1127,11 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
         last_error = "model arena page range is invalid";
         return DDO_VMM_INVALID_ARGUMENT;
     }
+    if (begin_page >= arena->fault_ceiling_page) {
+        last_error = std::string("model arena admission boundary reached by ")
+            + arena->admission_limit_reason;
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
     if (!checked(cuInit(0), "cuInit")) {
         return DDO_VMM_CUDA_ERROR;
     }
@@ -1016,30 +1151,37 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
         if (page.allocation != 0) {
             continue;
         }
-        if (!model_arena_make_room(arena, begin_page, end_page)) {
-            set_error("model_arena_resident_budget", CUDA_ERROR_OUT_OF_MEMORY);
+        if (page.view_bootstrap_mapped) {
+            if (!checked(cuMemUnmap(arena->address + page_index * arena->page_size, arena->page_size), "cuMemUnmap")) {
+                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+                return DDO_VMM_CUDA_ERROR;
+            }
+            page.view_bootstrap_mapped = false;
+        }
+        // A sequential model pass with a resident set smaller than the model
+        // must retain the already admitted prefix. Replacing it page by page
+        // would guarantee a full re-upload on the next pass. The caller uses
+        // a short-lived ordinary CUDA tensor for ranges beyond this boundary.
+        if (page_index >= arena->fault_ceiling_page || !model_arena_can_admit_page(arena)) {
+            model_arena_limit_admission(arena, page_index, "resident capacity");
+            last_error = "model arena admission boundary reached by resident capacity";
             release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
             return DDO_VMM_OUT_OF_MEMORY;
         }
-        while (!make_dxgi_budget_room(arena->device_ordinal, arena->page_size, arena->backing_kind)) {
-            if (!model_arena_evict_one(arena, begin_page, end_page)) {
-                set_error("dxgi_budget_guard", CUDA_ERROR_OUT_OF_MEMORY);
-                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
-                return DDO_VMM_OUT_OF_MEMORY;
-            }
+        if (!make_dxgi_budget_room(
+            arena->device_ordinal, arena->page_size, arena->backing_kind, true
+        )) {
+            model_arena_limit_admission(arena, page_index, "memory guard");
+            last_error = "model arena admission boundary reached by memory guard";
+            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+            return DDO_VMM_OUT_OF_MEMORY;
         }
         CUmemGenericAllocationHandle allocation = 0;
-        while (cuMemCreate(&allocation, arena->page_size, &properties, 0) != CUDA_SUCCESS) {
-            allocation = 0;
-            // The model arena owns its resident set.  Even with the DXGI
-            // guard enabled, an allocation miss must first evict an unpinned
-            // arena page and retry; otherwise the guard turns normal pressure
-            // into an immediate OOM at the local VRAM boundary.
-            if (!model_arena_evict_one(arena, begin_page, end_page)) {
-                set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
-                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
-                return DDO_VMM_OUT_OF_MEMORY;
-            }
+        if (cuMemCreate(&allocation, arena->page_size, &properties, 0) != CUDA_SUCCESS) {
+            model_arena_limit_admission(arena, page_index, "CUDA allocation pressure");
+            last_error = "model arena admission boundary reached by CUDA allocation pressure";
+            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+            return DDO_VMM_OUT_OF_MEMORY;
         }
         const CUdeviceptr page_address = arena->address + page_index * arena->page_size;
         if (!checked(cuMemMap(page_address, arena->page_size, 0, allocation, 0), "cuMemMap")) {

@@ -8,8 +8,11 @@ PyTorch's global allocator and does not depend on any external implementation.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import re
+import threading
+import time
 from typing import Any
 
 from .native import NativeVmmError
@@ -31,6 +34,9 @@ class VmmModuleAdapter:
         self._bindings: list[_Binding] = []
         self._handles: list[Any] = []
         self._temporary_lifetimes: list[tuple[Any, dict[str, Any]]] = []
+        self._read_executor: ThreadPoolExecutor | None = None
+        self._prefetch_futures: dict[str, Any] = {}
+        self._prefetch_lock = threading.RLock()
 
     def _collect_temporary_lifetimes(self, *, wait: bool = False) -> None:
         import torch
@@ -131,7 +137,15 @@ class VmmModuleAdapter:
         self._handles.append(module.register_forward_hook(after))
         return [binding.group_name for binding in bindings]
 
-    def attach_module_tree(self, root: Any, module_pattern: str, *, recursive: bool = True) -> list[str]:
+    def attach_module_tree(
+        self,
+        root: Any,
+        module_pattern: str,
+        *,
+        recursive: bool = True,
+        background_prefetch: bool = False,
+        prefetch_distance: int = 1,
+    ) -> list[str]:
         """Attach matching blocks as packed VMM execution groups.
 
         Each matching block gets one stable virtual region containing all of its
@@ -143,10 +157,16 @@ class VmmModuleAdapter:
         if not isinstance(root, torch.nn.Module):
             raise TypeError("root must be a torch.nn.Module")
         pattern = re.compile(module_pattern)
+        if prefetch_distance <= 0:
+            raise ValueError("prefetch_distance must be positive")
         attached_ids: set[int] = set()
         group_names: list[str] = []
         all_block_names: list[str] = []
         copy_stream = torch.cuda.Stream()
+        if background_prefetch:
+            if self._read_executor is not None:
+                raise RuntimeError("background prefetch is already configured")
+            self._read_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ddo-vmm-stage")
         for block_name, block in root.named_modules():
             if not block_name or not pattern.search(block_name):
                 continue
@@ -187,6 +207,24 @@ class VmmModuleAdapter:
             all_block_names.append(block_name)
             group_names.append(block_name)
 
+            def stage_group(index: int, *, all_blocks=all_block_names) -> None:
+                if index < len(all_blocks):
+                    self.arena.prefetch_loaded_group(all_blocks[index], copy_stream)
+
+            def submit_stage(index: int, *, all_blocks=all_block_names) -> None:
+                if index >= len(all_blocks):
+                    return
+                name = all_blocks[index]
+                with self._prefetch_lock:
+                    if name in self._prefetch_futures:
+                        return
+
+                    def worker() -> None:
+                        torch.cuda.set_device(self.arena._device_ordinal)
+                        stage_group(index)
+
+                    self._prefetch_futures[name] = self._read_executor.submit(worker)
+
             def before(
                 _module: Any,
                 _args: tuple[Any, ...],
@@ -201,7 +239,19 @@ class VmmModuleAdapter:
                 self.arena.collect_completed_events()
                 block_state["temporary_views"] = None
                 try:
-                    self.arena.prefetch_loaded_group(group_name, copy_stream)
+                    if self._read_executor is None:
+                        stage_group(group_index)
+                    else:
+                        with self._prefetch_lock:
+                            future = self._prefetch_futures.pop(group_name, None)
+                        if future is None:
+                            stage_group(group_index)
+                        else:
+                            future_wait_started = time.perf_counter()
+                            future.result()
+                            self.arena.record_prefetch_future_wait(
+                                time.perf_counter() - future_wait_started
+                            )
                 except (WeightArenaError, NativeVmmError):
                     # The current group is mandatory.  If a previously launched
                     # kernel still pins the available budget, wait rather than
@@ -218,14 +268,19 @@ class VmmModuleAdapter:
                         for relative_name, owner, parameter_name, _source in module_entries:
                             owner._parameters[parameter_name].data = temporary_views[relative_name]
                 else:
-                    next_index = group_index + 1
-                    if next_index < len(all_blocks):
+                    next_indices = range(group_index + 1, group_index + 1 + prefetch_distance)
+                    for next_index in next_indices:
+                        if next_index >= len(all_blocks):
+                            break
                         try:
-                            self.arena.prefetch_loaded_group(all_blocks[next_index], copy_stream)
+                            if self._read_executor is None:
+                                stage_group(next_index)
+                            else:
+                                submit_stage(next_index)
                         except (WeightArenaError, NativeVmmError):
                             # Look-ahead is optional.  A sub-page resident
                             # budget may fit one rounded block but not two.
-                            pass
+                            continue
                     self.arena.wait_for_prefetch_group(group_name)
 
             def after(
@@ -264,6 +319,15 @@ class VmmModuleAdapter:
     def close(self) -> None:
         self._collect_temporary_lifetimes(wait=True)
         self._temporary_lifetimes.clear()
+        executor = self._read_executor
+        if executor is not None:
+            with self._prefetch_lock:
+                futures = list(self._prefetch_futures.values())
+                self._prefetch_futures.clear()
+            for future in futures:
+                future.result()
+            executor.shutdown(wait=True)
+            self._read_executor = None
         for handle in self._handles:
             handle.remove()
         self._handles.clear()

@@ -48,6 +48,7 @@ class _TensorBinding:
     owner: Any
     parameter_name: str
     source: Any
+    file_slice: Any | None
     stable: Any
     offset: int
     nbytes: int
@@ -56,6 +57,22 @@ class _TensorBinding:
     @property
     def virtual_address(self) -> int:
         return self.owner._parameters[self.parameter_name].data_ptr()
+
+
+@dataclass(frozen=True)
+class _FileTensorDescriptor:
+    """Tensor metadata retained when immutable payload bytes stay in a shard."""
+
+    shape: tuple[int, ...]
+    dtype: Any
+    nbytes: int
+    element_size_bytes: int
+
+    def numel(self) -> int:
+        return self.nbytes // self.element_size_bytes
+
+    def element_size(self) -> int:
+        return self.element_size_bytes
 
 
 @dataclass
@@ -97,6 +114,7 @@ class ModelArenaWeightStore:
         backing: str = "device",
         staging_pool: Any | None = None,
         file_slices: Any | None = None,
+        host_cache_bytes: int = 0,
     ) -> None:
         if payload_bytes <= 0:
             raise ValueError("payload_bytes must be positive")
@@ -117,8 +135,16 @@ class ModelArenaWeightStore:
         self._staging_pool = staging_pool
         self._file_slices = file_slices
         self.transfer_buffer = DeviceTransferBuffer(device_ordinal)
-        if RegisteredHostWeightRegistry is not None:
-            self._host_registry = RegisteredHostWeightRegistry(device_ordinal)
+        if host_cache_bytes < 0:
+            raise ValueError("host_cache_bytes must be non-negative")
+        # Direct registration of loader-owned CPU storage is an explicit
+        # high-RAM transport mode.  The default remains the bounded file
+        # staging path; do not implicitly register the complete model.
+        if host_cache_bytes > 0 and RegisteredHostWeightRegistry is not None:
+            self._host_registry = RegisteredHostWeightRegistry(
+                device_ordinal,
+                max_bytes=host_cache_bytes,
+            )
         self._runtime_stats: dict[str, int] = {
             "faults": 0,
             "signature_hits": 0,
@@ -126,8 +152,17 @@ class ModelArenaWeightStore:
             "file_uploads": 0,
             "upload_bytes": 0,
             "fault_failures": 0,
+        "guard_admission_failures": 0,
+        "cuda_admission_failures": 0,
+            "capacity_admission_failures": 0,
             "temporary_tensors": 0,
             "temporary_bytes": 0,
+        }
+        self._source_stats: dict[str, int] = {
+            "file_backed_bindings": 0,
+            "file_backed_bytes": 0,
+            "cpu_source_bindings": 0,
+            "cpu_source_bytes": 0,
         }
 
     @property
@@ -149,6 +184,7 @@ class ModelArenaWeightStore:
     def runtime_stats(self) -> dict[str, int]:
         info = self.native.info
         result = dict(self._runtime_stats)
+        result.update(self._source_stats)
         result["resident_bytes"] = info.resident_size
         result["fault_ceiling_bytes"] = info.fault_ceiling
         result["virtual_bytes"] = info.virtual_size
@@ -157,23 +193,38 @@ class ModelArenaWeightStore:
 
     def stable_tensor(self, *, offset: int, source: Any) -> tuple[Any, int]:
         try:
-            initial_signature = self.native.fault_range(offset, source.numel() * source.element_size())
+            self.native.prepare_view_range(offset, source.numel() * source.element_size())
         except NativeVmmError:
-            # Keep CPU storage until the first block fault.
+            # If a CUDA view cannot be represented, the module hook retains
+            # the source and takes its temporary CUDA fallback.
             return source, None
-        byte_tensor, buffer = cuda_uint8_tensor_from_address(
-            self.address + offset,
-            source.numel() * source.element_size(),
-            owner=self.native,
-            backing=self._backing,
-        )
+        try:
+            byte_tensor, buffer = cuda_uint8_tensor_from_address(
+                self.address + offset,
+                source.numel() * source.element_size(),
+                owner=self.native,
+                backing=self._backing,
+            )
+        finally:
+            self.native.release_view_range(offset, source.numel() * source.element_size())
         self._buffers.append(buffer)
         stable = byte_tensor.view(source.dtype).view(tuple(source.shape))
-        # Initial contents are seeded once in bulk after all bindings have been
-        # laid out.  Per-tensor DMA here would turn model attachment into
-        # thousands of small PCIe transfers.
-        self.native.unpin_range(offset, source.numel() * source.element_size())
-        return stable, initial_signature
+        # This only creates a persistent virtual view. Runtime faults own
+        # physical residency and establish the first content signature.
+        return stable, None
+
+    def _source_for_upload(self, binding: _TensorBinding) -> Any:
+        if binding.file_slice is None:
+            return binding.source
+        if self._staging_pool is None:
+            raise ModelArenaError("file-backed weight requires a staging pool")
+        try:
+            self._staging_pool.begin_upload()
+            source = self._staging_pool.stage_file_slice(binding.source, binding.file_slice)
+            self._runtime_stats["file_uploads"] += 1
+            return source
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ModelArenaError("unable to stage file-backed weight") from error
 
     def fault_and_copy_if_needed(self, binding: _TensorBinding) -> None:
         self._runtime_stats["faults"] += 1
@@ -181,35 +232,39 @@ class ModelArenaWeightStore:
         if binding.signature == signature:
             self._runtime_stats["signature_hits"] += 1
             return
-        source = binding.source
-        if self._staging_pool is not None and self._file_slices is not None:
-            file_slice = self._file_slices.lookup(source)
-            if file_slice is not None:
-                try:
-                    self._staging_pool.begin_upload()
-                    source = self._staging_pool.stage_file_slice(source, file_slice)
-                    self._runtime_stats["file_uploads"] += 1
-                except (OSError, RuntimeError, ValueError):
-                    # A tensor larger than the bounded ring (or an unavailable
-                    # shard) falls back to the registered loader-owned buffer.
-                    source = binding.source
-        if self._host_registry is not None and self._host_registry.register(source):
+        source = self._source_for_upload(binding)
+        if (
+            binding.file_slice is None
+            and self._host_registry is not None
+            and self._host_registry.register(source)
+        ):
             self.native.copy_from_host(binding.offset, source)
         else:
-            if binding.source.dtype == binding.stable.dtype:
-                binding.stable.copy_(binding.source, non_blocking=True)
+            if source.dtype == binding.stable.dtype:
+                binding.stable.copy_(source, non_blocking=True)
             else:
-                converted = binding.source.to(dtype=binding.stable.dtype, device=binding.stable.device)
+                converted = source.to(dtype=binding.stable.dtype, device=binding.stable.device)
                 binding.stable.copy_(converted, non_blocking=True)
         binding.signature = signature
         self._runtime_stats["uploads"] += 1
         self._runtime_stats["upload_bytes"] += binding.nbytes
 
+    def temporary_source(self, binding: _TensorBinding) -> Any:
+        """Materialize a source only for the short-lived fallback view."""
+        return self._source_for_upload(binding)
+
     def unpin(self, binding: _TensorBinding) -> None:
         self.native.unpin_range(binding.offset, binding.nbytes)
 
-    def record_fault_failure(self) -> None:
+    def record_fault_failure(self, error: BaseException | None = None) -> None:
         self._runtime_stats["fault_failures"] += 1
+        message = str(error)
+        if "memory guard" in message:
+            self._runtime_stats["guard_admission_failures"] += 1
+        elif "CUDA allocation pressure" in message:
+            self._runtime_stats["cuda_admission_failures"] += 1
+        elif "resident capacity" in message:
+            self._runtime_stats["capacity_admission_failures"] += 1
 
     def record_temporary(self, nbytes: int) -> None:
         self._runtime_stats["temporary_tensors"] += 1
@@ -309,6 +364,11 @@ class ModelArenaModuleAdapter:
                 source = parameter.detach()
                 if source.device.type != "cpu" or not source.is_contiguous():
                     source = source.to(device="cpu").contiguous()
+                file_slice = (
+                    self.store._file_slices.lookup(source)
+                    if self.store._file_slices is not None and self.store._staging_pool is not None
+                    else None
+                )
                 # Register loader-owned host storage once at attachment time.
                 # The registry retains the registration until store.close(),
                 # so faults do not repeat host registration work.
@@ -320,11 +380,25 @@ class ModelArenaModuleAdapter:
                     raise ModelArenaError("model arena virtual span is smaller than attached payload")
                 stable, initial_signature = self.store.stable_tensor(offset=offset, source=source)
                 module.register_parameter(parameter_name, torch.nn.Parameter(stable, requires_grad=False))
+                if file_slice is not None and stable.device.type != "cpu":
+                    retained_source: Any = _FileTensorDescriptor(
+                        shape=tuple(source.shape),
+                        dtype=source.dtype,
+                        nbytes=nbytes,
+                        element_size_bytes=source.element_size(),
+                    )
+                    self.store._source_stats["file_backed_bindings"] += 1
+                    self.store._source_stats["file_backed_bytes"] += nbytes
+                else:
+                    retained_source = source
+                    self.store._source_stats["cpu_source_bindings"] += 1
+                    self.store._source_stats["cpu_source_bytes"] += nbytes
                 tensor_bindings.append(
                     _TensorBinding(
                         owner=module,
                         parameter_name=parameter_name,
-                        source=source,
+                        source=retained_source,
+                        file_slice=file_slice if retained_source is not source else None,
                         stable=stable,
                         offset=offset,
                         nbytes=nbytes,
@@ -368,8 +442,8 @@ class ModelArenaModuleAdapter:
                             state.stable_data[binding.parameter_name] = binding.stable
                             binding.owner._parameters[binding.parameter_name] = torch.nn.Parameter(binding.stable, requires_grad=False)
                         pinned.append(binding)
-                except (ModelArenaError, NativeVmmError, VmmTensorViewError):
-                    self.store.record_fault_failure()
+                except (ModelArenaError, NativeVmmError, VmmTensorViewError) as error:
+                    self.store.record_fault_failure(error)
                     for binding in reversed(pinned):
                         try:
                             self.store.unpin(binding)
@@ -377,7 +451,10 @@ class ModelArenaModuleAdapter:
                             pass
                     temporary_views: dict[str, Any] = {}
                     for binding in state.tensors:
-                        temporary = binding.source.to(device=binding.stable.device, non_blocking=True)
+                        temporary = self.store.temporary_source(binding).to(
+                            device=f"cuda:{self.store._device_ordinal}",
+                            non_blocking=True,
+                        )
                         temporary_views[binding.parameter_name] = temporary
                         binding.owner._parameters[binding.parameter_name].data = temporary
                         self.store.record_temporary(binding.nbytes)
@@ -387,7 +464,6 @@ class ModelArenaModuleAdapter:
                 import torch
 
                 if state.temporary_views is not None:
-                    torch.cuda.current_stream(self.store._device_ordinal).synchronize()
                     event = torch.cuda.Event(enable_timing=False)
                     event.record(torch.cuda.current_stream(self.store._device_ordinal))
                     self._temporary_lifetimes.append((event, state.temporary_views))
@@ -442,6 +518,7 @@ def attach_model_linear_modules(
     backing: str = "device",
     staging_pool: Any | None = None,
     file_slices: Any | None = None,
+    host_cache_bytes: int = 0,
 ) -> tuple[ModelArenaAttachReport, ModelArenaWeightStore]:
     """Create one model arena and attach matching dense linear weights."""
 
@@ -476,6 +553,7 @@ def attach_model_linear_modules(
         backing=backing,
         staging_pool=staging_pool,
         file_slices=file_slices,
+        host_cache_bytes=host_cache_bytes,
     )
     adapter = ModelArenaModuleAdapter(store)
     report = adapter.attach_linear_modules(root, module_pattern)

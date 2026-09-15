@@ -123,6 +123,21 @@ DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_fault_range(
     size_t size_bytes,
     uint64_t* out_signature
 );
+/**
+ * Temporarily map a small reusable physical page across a virtual range so a
+ * CUDA DLPack view can be constructed. Call release_view_range immediately
+ * afterwards; this mapping is never model-weight residency.
+ */
+DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_prepare_view_range(
+    ddo_vmm_model_arena* arena,
+    size_t offset_bytes,
+    size_t size_bytes
+);
+DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_release_view_range(
+    ddo_vmm_model_arena* arena,
+    size_t offset_bytes,
+    size_t size_bytes
+);
 DDO_VMM_API ddo_vmm_status ddo_vmm_model_arena_copy_from_host(
     ddo_vmm_model_arena* arena,
     size_t offset_bytes,

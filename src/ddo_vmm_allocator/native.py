@@ -122,6 +122,18 @@ class NativeVmmLibrary:
             ctypes.POINTER(ctypes.c_uint64),
         ]
         self._library.ddo_vmm_model_arena_fault_range.restype = ctypes.c_int
+        self._library.ddo_vmm_model_arena_prepare_view_range.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        self._library.ddo_vmm_model_arena_prepare_view_range.restype = ctypes.c_int
+        self._library.ddo_vmm_model_arena_release_view_range.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        self._library.ddo_vmm_model_arena_release_view_range.restype = ctypes.c_int
         self._library.ddo_vmm_model_arena_copy_from_host.argtypes = [
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p
         ]
@@ -393,6 +405,22 @@ class NativeModelArena:
         ) != 0:
             raise NativeVmmError(self._owner._last_error())
         return int(signature.value)
+
+    def prepare_view_range(self, offset_bytes: int, size_bytes: int) -> None:
+        if self._handle is None:
+            raise NativeVmmError("model arena is closed")
+        if self._owner._library.ddo_vmm_model_arena_prepare_view_range(
+            self._handle, offset_bytes, size_bytes
+        ) != 0:
+            raise NativeVmmError(self._owner._last_error())
+
+    def release_view_range(self, offset_bytes: int, size_bytes: int) -> None:
+        if self._handle is None:
+            raise NativeVmmError("model arena is closed")
+        if self._owner._library.ddo_vmm_model_arena_release_view_range(
+            self._handle, offset_bytes, size_bytes
+        ) != 0:
+            raise NativeVmmError(self._owner._last_error())
 
     def unpin_range(self, offset_bytes: int, size_bytes: int) -> None:
         """Release one pin acquired by fault_range."""

@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import time
 from typing import Any, Iterator
 
 from .native import NativeVmmLibrary, NativeVmmRegion
@@ -72,7 +73,7 @@ class VmmWeightArena:
         self._file_slices: Any | None = None
         self._staging_pool: Any | None = None
         self._registered_host: Any | None = None
-        self._runtime_stats: dict[str, int] = {
+        self._runtime_stats: dict[str, int | float] = {
             "materializations": 0,
             "lost_residency": 0,
             "uploads": 0,
@@ -84,6 +85,11 @@ class VmmWeightArena:
             "evictions": 0,
             "temporary_groups": 0,
             "temporary_bytes": 0,
+            "file_stage_seconds": 0.0,
+            "consumer_wait_seconds": 0.0,
+            "prefetch_requests": 0,
+            "prefetch_ready_hits": 0,
+            "prefetch_future_wait_seconds": 0.0,
         }
         self._closed = False
 
@@ -93,7 +99,7 @@ class VmmWeightArena:
         for key in self._runtime_stats:
             self._runtime_stats[key] = 0
 
-    def runtime_stats(self) -> dict[str, int]:
+    def runtime_stats(self) -> dict[str, int | float]:
         """Return transfer/residency counters for the current measured interval."""
 
         result = dict(self._runtime_stats)
@@ -120,6 +126,10 @@ class VmmWeightArena:
         if self._groups:
             raise WeightArenaError("configure registered host transport before reserving weight groups")
         self._registered_host = registry
+
+    def record_prefetch_future_wait(self, seconds: float) -> None:
+        """Record host-side waiting for a scheduled shard read to complete."""
+        self._runtime_stats["prefetch_future_wait_seconds"] += max(0.0, seconds)
     def packed_source_groups(self) -> list[tuple[str, list[tuple[str, Any]]]]:
         """Return the immutable CPU source layout for each packed group."""
         return [
@@ -286,7 +296,9 @@ class VmmWeightArena:
             entries = [(source, self._file_slices.lookup(source)) for _, source, _ in group.packed_sources]
             if entries and all(file_slice is not None for _, file_slice in entries):
                 self._staging_pool.begin_upload()
+                stage_started = time.perf_counter()
                 staged_bytes = self._staging_pool.stage_file_slices(entries)
+                self._runtime_stats["file_stage_seconds"] += time.perf_counter() - stage_started
                 expected_bytes = sum(source.numel() * source.element_size() for _, source, _ in group.packed_sources)
                 if staged_bytes != expected_bytes:
                     raise WeightArenaError(f"checkpoint slice payload mismatch for VMM group {group.name!r}")
@@ -421,6 +433,7 @@ class VmmWeightArena:
         group = self._group(name)
         if not group.packed_sources or group.tensor_view is None:
             raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
+        self._runtime_stats["prefetch_requests"] += 1
         if group.payload_loaded:
             # A previous forward may have released the group after its CUDA
             # event completed.  Retain it again before this forward uses the
@@ -428,6 +441,7 @@ class VmmWeightArena:
             # pin already belongs to this forthcoming consumer.
             if group.pin_count == 0:
                 self._pin_payload_range(group, group.packed_payload_bytes)
+            self._runtime_stats["prefetch_ready_hits"] += 1
             return
         self._pin_payload_range(group, group.packed_payload_bytes)
         self._upload_packed_group(group, stream)
@@ -436,7 +450,9 @@ class VmmWeightArena:
         if group.upload_event is not None:
             import torch
 
+            wait_started = time.perf_counter()
             torch.cuda.current_stream(self._device_ordinal).wait_event(group.upload_event)
+            self._runtime_stats["consumer_wait_seconds"] += time.perf_counter() - wait_started
             group.upload_event = None
         if not group.packed_sources:
             raise WeightArenaError(f"weight group has no packed CPU sources: {name}")
