@@ -3,12 +3,18 @@ cmake_minimum_required(VERSION 3.25)
 project(ddo_vmm_allocator VERSION 0.1.0 LANGUAGES CXX)
 
 option(DDO_VMM_BUILD_PROBES "Build standalone CUDA Driver VMM probes" ON)
+option(DDO_VMM_NATIVE_SPAN_POOL "Build the unpromoted native span-pool candidate" OFF)
+option(DDO_VMM_NATIVE_SOURCE_DISPATCHER "Build the unpromoted asynchronous source dispatcher" OFF)
+option(DDO_VMM_SOURCE_TEST_HOOKS "Enable isolated source lifecycle fault injection (never production)" OFF)
 
 find_package(CUDAToolkit REQUIRED)
 
 add_library(ddo_vmm SHARED
     native/src/ddo_vmm.cpp
+    native/src/ddo_vmm_source.cpp
+    native/src/ddo_vmm_source_cache.cpp
     native/src/ddo_vmm_torch_allocator.cpp
+    native/src/ddo_vmm_timeline.cpp
 )
 
 target_compile_features(ddo_vmm PRIVATE cxx_std_20)
@@ -18,6 +24,16 @@ target_include_directories(ddo_vmm
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/native/include>
 )
 target_link_libraries(ddo_vmm PRIVATE CUDA::cuda_driver)
+if(DDO_VMM_SOURCE_TEST_HOOKS)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_SOURCE_TEST_HOOKS=1)
+endif()
+if(DDO_VMM_NATIVE_SOURCE_DISPATCHER)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_NATIVE_SOURCE_DISPATCHER=1)
+endif()
+if(DDO_VMM_NATIVE_SPAN_POOL)
+    target_sources(ddo_vmm PRIVATE native/src/ddo_vmm_torch_pool.cpp)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_NATIVE_SPAN_POOL=1)
+endif()
 
 if(WIN32)
     target_link_libraries(ddo_vmm PRIVATE dxgi)
@@ -30,6 +46,28 @@ else()
 endif()
 
 if(DDO_VMM_BUILD_PROBES)
+    # Pure CPU contracts: no CUDA library, context or device initialization.
+    add_executable(ddo_vmm_source_flights_test native/tests/source_flights_test.cpp)
+    target_compile_features(ddo_vmm_source_flights_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_source_flights_test PRIVATE native/include)
+    add_executable(ddo_vmm_read_wait_test native/tests/read_wait_test.cpp)
+    target_compile_features(ddo_vmm_read_wait_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_read_wait_test PRIVATE native/include)
+    add_executable(ddo_vmm_source_scheduler_test native/tests/source_scheduler_test.cpp)
+    target_compile_features(ddo_vmm_source_scheduler_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_source_scheduler_test PRIVATE native/include)
+    add_executable(ddo_vmm_span_ledger_test native/tests/span_ledger_test.cpp)
+    target_compile_features(ddo_vmm_span_ledger_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_span_ledger_test PRIVATE native/include)
+    add_executable(ddo_vmm_cache_selection_test native/tests/cache_selection_test.cpp)
+    target_compile_features(ddo_vmm_cache_selection_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_cache_selection_test PRIVATE native/include)
+    add_executable(ddo_vmm_allocation_footprint_test native/tests/allocation_footprint_test.cpp)
+    target_compile_features(ddo_vmm_allocation_footprint_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_allocation_footprint_test PRIVATE native/include)
+    add_executable(ddo_vmm_stream_dependency_test native/tests/stream_dependency_test.cpp)
+    target_compile_features(ddo_vmm_stream_dependency_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_stream_dependency_test PRIVATE native/include)
     add_executable(ddo_vmm_driver_probe native/tests/vmm_driver_probe.cpp)
     target_compile_features(ddo_vmm_driver_probe PRIVATE cxx_std_20)
     target_link_libraries(ddo_vmm_driver_probe PRIVATE ddo_vmm CUDA::cuda_driver)

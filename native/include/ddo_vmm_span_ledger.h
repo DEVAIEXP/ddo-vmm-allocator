@@ -1,0 +1,250 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <iterator>
+#include <list>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <vector>
+
+namespace ddo_vmm_detail {
+
+// An eventual CUDA owner can derive from this type. The ledger holds strong
+// references but never queries, waits for, or destroys CUDA handles itself.
+struct SpanFence { virtual ~SpanFence() = default; };
+using SpanFenceOwner = std::shared_ptr<const SpanFence>;
+enum class SpanState { available, reserved, live, pending, quarantined };
+enum class SpanCompletion { complete, not_ready, failed };
+
+// One mapped backing, externally serialized. No physical allocation or CUDA
+// policy. Generation must be unique when a backing owner is replaced.
+class SpanLedger {
+public:
+    struct Lease {
+        const SpanLedger* owner;
+        uint64_t generation, id;
+        size_t offset, size, requested;
+        std::vector<SpanFenceOwner> dependencies;
+    };
+    struct Snapshot {
+        size_t mapped = 0, requested = 0, leased = 0, available = 0,
+               pending = 0, quarantined = 0, live_count = 0, reserved_count = 0;
+    };
+
+    SpanLedger(size_t mapped, int device, uint64_t generation)
+        : mapped_(mapped), device_(device), generation_(generation) {
+        if (!mapped || mapped % alignment || device < 0 || !generation)
+            throw std::invalid_argument("invalid span backing identity/size");
+        spans_.push_back({0, mapped, 0, 0, SpanState::available, {}});
+    }
+    SpanLedger(const SpanLedger&) = delete;
+    SpanLedger& operator=(const SpanLedger&) = delete;
+
+    std::optional<Lease> reserve(size_t requested, int device) {
+        if (released_ || release_pending_ || device != device_ || next_id_ == UINT64_MAX) return {};
+        const auto size = aligned_size(requested);
+        if (!size) return {};
+        auto best = spans_.end();
+        for (auto it = spans_.begin(); it != spans_.end(); ++it) {
+            if ((it->state == SpanState::available || it->state == SpanState::pending)
+                && it->size >= *size && (best == spans_.end() || it->size < best->size))
+                best = it;
+        }
+        if (best == spans_.end()) return {};
+        // All throwing metadata copies/insertion happen before changing the
+        // selected span. Failure leaves its partition and ownership untouched.
+        Lease lease{this, generation_, next_id_, best->offset, *size, requested,
+                    best->dependencies};
+        if (best->size > *size)
+            spans_.insert(std::next(best), {best->offset + *size, best->size - *size,
+                          0, 0, best->state, best->dependencies});
+        best->size = *size;
+        best->requested = requested;
+        best->id = next_id_++;
+        best->state = SpanState::reserved;
+        return lease;
+    }
+
+    std::optional<size_t> fit_size(size_t requested, int device) const {
+        if (released_ || release_pending_ || device != device_ || next_id_ == UINT64_MAX) return {};
+        const auto size = aligned_size(requested);
+        if (!size) return {};
+        std::optional<size_t> best;
+        for (const auto& span : spans_)
+            if ((span.state == SpanState::available || span.state == SpanState::pending)
+                && span.size >= *size && (!best || span.size < *best)) best = span.size;
+        return best;
+    }
+
+    std::vector<SpanFenceOwner> pending_fences() const {
+        std::vector<SpanFenceOwner> result;
+        for (const auto& span : spans_) {
+            if (span.state != SpanState::pending) continue;
+            for (const auto& fence : span.dependencies) {
+                bool found = false;
+                for (const auto& existing : result) found |= existing == fence;
+                if (!found) result.push_back(fence);
+            }
+        }
+        return result;
+    }
+
+    bool publish(const Lease& lease, bool dependencies_enqueued) {
+        auto it = find(lease, SpanState::reserved);
+        if (it == spans_.end()) return false;
+        it->state = dependencies_enqueued ? SpanState::live : SpanState::quarantined;
+        return dependencies_enqueued;
+    }
+
+    // Valid only before any submission/publication. After partial submission
+    // the caller must quarantine, never roll back as though no work happened.
+    bool cancel_unsubmitted(const Lease& lease) {
+        auto it = find(lease, SpanState::reserved);
+        if (it == spans_.end()) return false;
+        it->state = it->dependencies.empty() ? SpanState::available : SpanState::pending;
+        it->requested = 0;
+        it->id = 0;
+        coalesce();
+        return true;
+    }
+
+    bool retire(const Lease& lease, SpanFenceOwner consumer_completion) {
+        auto it = find(lease, SpanState::live);
+        if (it == spans_.end()) return false;
+        if (!consumer_completion) {
+            it->state = SpanState::quarantined;
+            return false;
+        }
+        // Caller proves this fence covers predecessor waits + all consumer
+        // work. Construct first: metadata failure keeps the live lease intact.
+        std::vector<SpanFenceOwner> dependencies{std::move(consumer_completion)};
+        it->dependencies.swap(dependencies);
+        it->requested = 0;
+        it->id = 0;
+        it->state = SpanState::pending;
+        coalesce();
+        return true;
+    }
+
+    void observe(const SpanFenceOwner& fence, SpanCompletion proof) {
+        if (!fence || proof == SpanCompletion::not_ready) return;
+        for (auto& span : spans_) {
+            if (span.state != SpanState::pending) continue;
+            for (auto it = span.dependencies.begin(); it != span.dependencies.end(); ++it) {
+                if (*it != fence) continue;
+                if (proof == SpanCompletion::failed) span.state = SpanState::quarantined;
+                else {
+                    span.dependencies.erase(it);
+                    if (span.dependencies.empty()) span.state = SpanState::available;
+                }
+                break;
+            }
+        }
+        coalesce();
+    }
+
+    Snapshot snapshot() const {
+        Snapshot result;
+        result.mapped = released_ ? 0 : mapped_;
+        if (released_) return result;
+        if (release_pending_) {
+            result.pending = mapped_;
+            return result;
+        }
+        for (const auto& span : spans_) {
+            switch (span.state) {
+            case SpanState::reserved:
+                ++result.reserved_count;
+                result.requested += span.requested;
+                result.leased += span.size;
+                break;
+            case SpanState::live:
+                ++result.live_count;
+                result.requested += span.requested;
+                result.leased += span.size;
+                break;
+            case SpanState::available: result.available += span.size; break;
+            case SpanState::pending: result.pending += span.size; break;
+            case SpanState::quarantined: result.quarantined += span.size; break;
+            }
+        }
+        return result;
+    }
+
+    bool releasable() const {
+        if (released_ || release_pending_) return false;
+        for (const auto& span : spans_)
+            if (span.state != SpanState::available || !span.dependencies.empty()) return false;
+        return true;
+    }
+    // Reserve ownership under the caller's lock; actual native destruction
+    // happens outside it. No new allocation can enter while release is pending.
+    bool begin_backing_release() {
+        if (!releasable()) return false;
+        release_pending_ = true;
+        return true;
+    }
+    bool commit_backing_release() {
+        if (!release_pending_ || released_) return false;
+        release_pending_ = false;
+        released_ = true;
+        spans_.clear();
+        return true;
+    }
+    bool fail_backing_release() {
+        if (!release_pending_) return false;
+        release_pending_ = false;
+        // Partial native destruction cannot be treated as reusable backing.
+        for (auto& span : spans_) span.state = SpanState::quarantined;
+        return true;
+    }
+    bool quarantine_idle_backing() {
+        if (released_ || release_pending_) return false;
+        for (const auto& span : spans_)
+            if (span.state == SpanState::live || span.state == SpanState::reserved) return false;
+        for (auto& span : spans_) span.state = SpanState::quarantined;
+        return true;
+    }
+
+private:
+    static constexpr size_t alignment = 512;
+    struct Span {
+        size_t offset, size, requested;
+        uint64_t id;
+        SpanState state;
+        std::vector<SpanFenceOwner> dependencies;
+    };
+    std::list<Span> spans_;
+    size_t mapped_;
+    int device_;
+    uint64_t generation_, next_id_ = 1;
+    bool released_ = false, release_pending_ = false;
+
+    static std::optional<size_t> aligned_size(size_t requested) {
+        const size_t normalized = requested ? requested : alignment;
+        if (normalized > std::numeric_limits<size_t>::max() - (alignment - 1)) return {};
+        return ((normalized + alignment - 1) / alignment) * alignment;
+    }
+    auto find(const Lease& lease, SpanState state) -> std::list<Span>::iterator {
+        if (released_ || lease.owner != this || lease.generation != generation_) return spans_.end();
+        for (auto it = spans_.begin(); it != spans_.end(); ++it)
+            if (it->id == lease.id && it->offset == lease.offset && it->size == lease.size
+                && it->requested == lease.requested && it->state == state) return it;
+        return spans_.end();
+    }
+    void coalesce() {
+        for (auto it = spans_.begin(); it != spans_.end();) {
+            auto next = std::next(it);
+            if (next == spans_.end()) break;
+            if ((it->state == SpanState::available || it->state == SpanState::pending)
+                && it->state == next->state && it->dependencies == next->dependencies
+                && it->offset + it->size == next->offset) {
+                it->size += next->size;
+                spans_.erase(next);
+            } else ++it;
+        }
+    }
+};
+} // namespace ddo_vmm_detail

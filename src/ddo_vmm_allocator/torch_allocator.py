@@ -36,6 +36,13 @@ def install_pytorch_vmm_allocator(
         )
     path = Path(resolved_path).expanduser().resolve(strict=True)
 
+    from ._library import load_library, require_exports
+
+    library = load_library(path, TorchAllocatorInstallError)
+    require_exports(library, path,
+                    ("ddo_vmm_torch_malloc", "ddo_vmm_torch_free"),
+                    TorchAllocatorInstallError)
+
     import torch
 
     if not torch.cuda.is_available():
@@ -51,4 +58,3 @@ def install_pytorch_vmm_allocator(
     torch.cuda.memory.change_current_allocator(allocator)
     _installed_allocator = allocator
     return allocator
-

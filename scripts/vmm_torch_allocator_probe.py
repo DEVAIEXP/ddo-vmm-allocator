@@ -20,12 +20,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exercise allocator reuse after an asynchronous CUDA-stream free.",
     )
+    parser.add_argument(
+        "--verify-nonblocking-reuse",
+        action="store_true",
+        help="Require cross-stream cache reuse to return before producer completion (short GPU delay).",
+    )
     return parser.parse_args()
 
 
 def run(args: argparse.Namespace) -> None:
     if args.megabytes <= 0 or args.cache_mib < 0:
         raise ValueError("--megabytes must be positive and --cache-mib cannot be negative")
+    if (args.verify_stream_lifetime or args.verify_nonblocking_reuse) and args.cache_mib < args.megabytes:
+        raise ValueError("Stream reuse verification requires cache capacity at least equal to the allocation")
     if args.cache_mib:
         os.environ["DDO_VMM_TORCH_CACHE_MIB"] = str(args.cache_mib)
 
@@ -94,9 +101,53 @@ def run(args: argparse.Namespace) -> None:
             torch.cuda.synchronize(args.device)
             if replacement.data_ptr() != asynchronous_address:
                 raise RuntimeError("VMM cache did not reuse the asynchronous stream allocation")
+            if not bool(torch.all(replacement.cpu() == 0x3C)):
+                raise RuntimeError("Cross-stream reuse corrupted the replacement payload")
             del replacement
             gc.collect()
             torch.cuda.synchronize(args.device)
+
+        if args.verify_nonblocking_reuse:
+            if not hasattr(torch.cuda, "_sleep"):
+                raise RuntimeError("This diagnostic requires torch.cuda._sleep")
+            producer = torch.cuda.Stream(device=args.device)
+            consumer = torch.cuda.Stream(device=args.device)
+            tail = torch.cuda.Stream(device=args.device)
+            producer_done = torch.cuda.Event()
+            consumer_done = torch.cuda.Event()
+            with torch.cuda.stream(producer):
+                first = torch.empty(bytes_requested, dtype=torch.uint8, device="cuda")
+                first_address = first.data_ptr()
+                # Short bounded diagnostic delay, not a benchmark parameter.
+                torch.cuda._sleep(250_000_000)
+                first.fill_(0x5A)
+                producer_done.record()
+                del first
+            with torch.cuda.stream(consumer):
+                second = torch.empty(bytes_requested, dtype=torch.uint8, device="cuda")
+                if second.data_ptr() != first_address:
+                    raise RuntimeError("Producer mapping was not reused")
+                if producer_done.query():
+                    raise RuntimeError("Reuse did not return before producer completion; asynchronous gate failed")
+                torch.cuda._sleep(250_000_000)
+                second.fill_(0x3C)
+                consumer_done.record()
+                del second
+            with torch.cuda.stream(tail):
+                third = torch.empty(bytes_requested, dtype=torch.uint8, device="cuda")
+                if third.data_ptr() != first_address:
+                    raise RuntimeError("Consumer mapping was not reused")
+                if consumer_done.query():
+                    raise RuntimeError("Repeated reuse blocked until consumer completion")
+                third.fill_(0xA7)
+                payload = third.cpu()
+                if not bool(torch.all(payload == 0xA7)):
+                    raise RuntimeError("Repeated cross-stream reuse corrupted the final payload")
+                del third
+            torch.cuda.synchronize(args.device)
+            gc.collect()
+            if int(native.ddo_vmm_torch_live_allocation_count()) != 0:
+                raise RuntimeError("Stream reuse left live native allocations")
 
     print("PyTorch CUDAPluggableAllocator VMM probe: PASS")
     print(f"  torch: {torch.__version__}")
@@ -109,6 +160,8 @@ def run(args: argparse.Namespace) -> None:
         print(f"  stable address reused: 0x{reused_address:x}")
     if args.verify_stream_lifetime:
         print("  asynchronous stream lifetime: verified")
+    if args.verify_nonblocking_reuse:
+        print("  nonblocking reuse and renewed consumer fence: verified")
 
 
 if __name__ == "__main__":

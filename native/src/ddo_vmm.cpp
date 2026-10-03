@@ -1,13 +1,24 @@
 #include "ddo_vmm.h"
+#include "ddo_vmm_timeline.h"
+#include "source_io.h"
+#include "host_accounting.h"
+#include "ddo_vmm_read_wait.h"
 
 #include <cuda.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <chrono>
 #include <cstring>
+#include <deque>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -85,7 +96,103 @@ bool ensure_context(int device_ordinal, CUcontext* retained_primary_context) {
     return true;
 }
 
+#if defined(_WIN32)
+bool utf8_path_to_wide(const char* path_utf8, std::vector<wchar_t>* out_path) {
+    if (path_utf8 == nullptr || out_path == nullptr) {
+        last_error = "native shard path arguments are invalid";
+        return false;
+    }
+    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_utf8, -1, nullptr, 0);
+    if (required <= 0) {
+        last_error = "native shard path is not valid UTF-8";
+        return false;
+    }
+    out_path->resize(static_cast<size_t>(required));
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_utf8, -1, out_path->data(), required) <= 0) {
+        last_error = "native shard path conversion failed";
+        return false;
+    }
+    return true;
+}
+
+HANDLE open_native_shard_file(const char* path_utf8) {
+    std::vector<wchar_t> path;
+    if (!utf8_path_to_wide(path_utf8, &path)) {
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE file = CreateFileW(
+        path.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED, nullptr
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        last_error = "native shard file open failed";
+    }
+    return file;
+}
+
+bool read_file_handle_into_buffer(HANDLE file, uint64_t offset, void* destination, size_t size) {
+    if (file == INVALID_HANDLE_VALUE || destination == nullptr || size == 0 || size > std::numeric_limits<DWORD>::max()) {
+        last_error = "native shard read arguments are invalid";
+        return false;
+    }
+    OVERLAPPED request{};
+    request.Offset = static_cast<DWORD>(offset & 0xffffffffULL);
+    request.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    request.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (request.hEvent == nullptr) {
+        last_error = "native shard read event creation failed (Win32 " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    DWORD read = 0;
+    BOOL submitted = ReadFile(file, destination, static_cast<DWORD>(size), nullptr, &request);
+    if (!submitted && GetLastError() != ERROR_IO_PENDING) {
+        const DWORD error = GetLastError();
+        CloseHandle(request.hEvent);
+        last_error = "native shard positioned read submission failed (Win32 " + std::to_string(error) + ")";
+        return false;
+    }
+    if (!GetOverlappedResult(file, &request, &read, TRUE) || read != size) {
+        const DWORD error = GetLastError();
+        CloseHandle(request.hEvent);
+        last_error = "native shard positioned read failed or was short (Win32 " + std::to_string(error) + ")";
+        return false;
+    }
+    CloseHandle(request.hEvent);
+    return true;
+}
+
+bool read_file_into_buffer(const char* path_utf8, uint64_t offset, void* destination, size_t size) {
+    if (path_utf8 == nullptr || destination == nullptr || size == 0 || size > std::numeric_limits<DWORD>::max()) {
+        last_error = "native shard read arguments are invalid";
+        return false;
+    }
+    HANDLE file = open_native_shard_file(path_utf8);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const bool ok = read_file_handle_into_buffer(file, offset, destination, size);
+    CloseHandle(file);
+    return ok;
+}
+#endif
+
 }  // namespace
+
+#if defined(_WIN32)
+namespace ddo_source_io {
+HANDLE open_file(const char* path_utf8, std::string& error) {
+    HANDLE file = open_native_shard_file(path_utf8);
+    if (file == INVALID_HANDLE_VALUE) error = last_error;
+    return file;
+}
+
+bool read_file(HANDLE file, uint64_t offset, void* destination, size_t size, std::string& error) {
+    const bool succeeded = read_file_handle_into_buffer(file, offset, destination, size);
+    if (!succeeded) error = last_error;
+    return succeeded;
+}
+}
+#endif
 
 struct ddo_vmm_region {
     int device_ordinal = -1;
@@ -106,13 +213,22 @@ struct ddo_vmm_region {
 
 struct ddo_vmm_model_arena {
     int device_ordinal = -1;
+    std::mutex mutation_mutex;
     CUdeviceptr address = 0;
     size_t virtual_size = 0;
     size_t page_size = 0;
     size_t resident_budget = 0;
     size_t resident_pages = 0;
+    uint64_t materialized_pages = 0;
+    uint64_t reused_pages = 0;
+    uint64_t evicted_pages = 0;
+    uint64_t tail_evictions = 0;
+    uint64_t pressure_evictions = 0;
     size_t fault_ceiling_page = 0;
     const char* admission_limit_reason = "resident capacity";
+    CUevent compute_fence = nullptr;
+    bool compute_fence_recorded = false;
+    bool streaming_admission = false;
     CUmemGenericAllocationHandle view_bootstrap_allocation = 0;
     CUcontext retained_primary_context = nullptr;
     ddo_vmm_backing_kind backing_kind = DDO_VMM_BACKING_DEVICE;
@@ -121,11 +237,190 @@ struct ddo_vmm_model_arena {
         CUmemGenericAllocationHandle allocation = 0;
         uint32_t pin_count = 0;
         uint64_t generation = 0;
-        uint64_t last_touch = 0;
         bool view_bootstrap_mapped = false;
     };
     std::vector<Page> pages;
 };
+
+struct ddo_vmm_execution_pool {
+    struct Slot {
+        ddo_vmm_model_arena* arena = nullptr;
+        bool leased = false;
+        bool materialized = false;
+    };
+    std::mutex mutex;
+    std::vector<Slot> slots;
+    size_t next = 0;
+    ~ddo_vmm_execution_pool() {
+        for (auto& slot : slots) ddo_vmm_model_arena_destroy(slot.arena);
+    }
+};
+
+struct ddo_vmm_host_ring {
+    int device_ordinal = -1;
+    size_t slot_size = 0;
+    bool accounted_staging = false;
+    struct FileReadResult {
+        bool succeeded = false;
+        std::string error;
+    };
+    struct Slot {
+        void* address = nullptr;
+        CUevent completion = nullptr;
+        bool in_flight = false;
+        bool virtual_memory_registered = false;
+#if defined(DDO_VMM_NATIVE_SOURCE_DISPATCHER)
+        std::shared_future<FileReadResult> file_read;
+#else
+        std::future<FileReadResult> file_read;
+#endif
+        bool read_in_flight = false;
+        size_t read_waiters = 0;
+        bool read_busy() const { return read_in_flight || read_waiters != 0; }
+    };
+    std::mutex mutex;
+    std::vector<Slot> slots;
+    std::condition_variable read_waiters_retired;
+    bool closing = false;
+#if defined(_WIN32)
+    struct FileReadCompletion {
+        std::promise<FileReadResult> promise;
+        std::atomic<size_t> pending_chunks = 0;
+        std::atomic<bool> failed = false;
+        std::mutex error_mutex;
+        std::string error;
+    };
+    struct FileReadTask {
+        HANDLE file = INVALID_HANDLE_VALUE;
+        uint64_t offset = 0;
+        void* destination = nullptr;
+        size_t size = 0;
+        std::shared_ptr<FileReadCompletion> completion;
+    };
+    std::mutex source_mutex;
+    std::condition_variable source_ready;
+    std::condition_variable source_space;
+    std::deque<FileReadTask> source_queue;
+    std::vector<std::thread> source_workers;
+    bool source_stopping = false;
+    std::unordered_map<std::string, HANDLE> shard_files;
+    std::atomic<uint64_t> source_read_chunks = 0;
+    std::atomic<uint64_t> source_read_bytes = 0;
+    std::atomic<uint64_t> source_read_failures = 0;
+#endif
+};
+
+#if defined(_WIN32)
+constexpr size_t kNativeSourceChunkBytes = 2 * 1024 * 1024;
+constexpr size_t kNativeSourceWorkerLimit = 8;
+constexpr size_t kNativeSourceQueueLimit = 256;
+
+ddo_vmm_status enqueue_source_read_locked(
+    ddo_vmm_host_ring* ring, ddo_vmm_host_ring::Slot& slot,
+    HANDLE file, uint64_t file_offset_bytes, size_t size_bytes
+);
+
+void complete_host_ring_source_read(
+    const std::shared_ptr<ddo_vmm_host_ring::FileReadCompletion>& completion,
+    bool succeeded,
+    const std::string& error
+) {
+    if (!succeeded) {
+        completion->failed.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(completion->error_mutex);
+        if (completion->error.empty()) {
+            completion->error = error.empty() ? "native shard source chunk failed" : error;
+        }
+    }
+    if (completion->pending_chunks.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::string completion_error;
+        if (completion->failed.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(completion->error_mutex);
+            completion_error = completion->error;
+        }
+        completion->promise.set_value({completion_error.empty(), std::move(completion_error)});
+    }
+}
+
+bool enqueue_host_ring_source_task(ddo_vmm_host_ring* ring, ddo_vmm_host_ring::FileReadTask task) {
+    {
+        std::unique_lock<std::mutex> lock(ring->source_mutex);
+        ring->source_space.wait(lock, [ring] {
+            return ring->source_stopping || ring->source_queue.size() < kNativeSourceQueueLimit;
+        });
+        if (ring->source_stopping) {
+            return false;
+        }
+        ring->source_queue.push_back(std::move(task));
+    }
+    ring->source_ready.notify_one();
+    return true;
+}
+
+void host_ring_source_worker(ddo_vmm_host_ring* ring) {
+    for (;;) {
+        ddo_vmm_host_ring::FileReadTask task{};
+        {
+            std::unique_lock<std::mutex> lock(ring->source_mutex);
+            ring->source_ready.wait(lock, [ring] {
+                return ring->source_stopping || !ring->source_queue.empty();
+            });
+            if (ring->source_stopping && ring->source_queue.empty()) {
+                return;
+            }
+            task = std::move(ring->source_queue.front());
+            ring->source_queue.pop_front();
+        }
+        ring->source_space.notify_one();
+        const bool succeeded = read_file_handle_into_buffer(task.file, task.offset, task.destination, task.size);
+        ring->source_read_chunks.fetch_add(1, std::memory_order_relaxed);
+        ring->source_read_bytes.fetch_add(task.size, std::memory_order_relaxed);
+        if (!succeeded) {
+            ring->source_read_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        complete_host_ring_source_read(task.completion, succeeded, succeeded ? std::string{} : last_error);
+    }
+}
+
+bool start_host_ring_source_workers(ddo_vmm_host_ring* ring) {
+    const size_t worker_count = std::min<size_t>(kNativeSourceWorkerLimit, ring->slots.size());
+    try {
+        for (size_t index = 0; index < worker_count; ++index) {
+            ring->source_workers.emplace_back(host_ring_source_worker, ring);
+        }
+    } catch (const std::exception&) {
+        {
+            std::lock_guard<std::mutex> lock(ring->source_mutex);
+            ring->source_stopping = true;
+        }
+        ring->source_ready.notify_all();
+        for (std::thread& worker : ring->source_workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        ring->source_workers.clear();
+        last_error = "native shard source worker creation failed";
+        return false;
+    }
+    return true;
+}
+
+void stop_host_ring_source_workers(ddo_vmm_host_ring* ring) {
+    {
+        std::lock_guard<std::mutex> lock(ring->source_mutex);
+        ring->source_stopping = true;
+    }
+    ring->source_ready.notify_all();
+    ring->source_space.notify_all();
+    for (std::thread& worker : ring->source_workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    ring->source_workers.clear();
+}
+#endif
 
 namespace {
 
@@ -135,8 +430,13 @@ struct PressureEntry {
     uint64_t touch = 0;
 };
 
+struct ModelArenaPressureEntry {
+    ddo_vmm_model_arena* arena = nullptr;
+};
+
 std::mutex pressure_mutex;
 std::vector<PressureEntry> pressure_entries;
+std::vector<ModelArenaPressureEntry> pressure_model_arenas;
 uint64_t pressure_clock = 0;
 
 struct DxgiBudgetGuardConfig {
@@ -155,6 +455,29 @@ PressureEntry* pressure_entry(ddo_vmm_region* region) {
         }
     }
     return nullptr;
+}
+
+void register_model_arena_pressure(ddo_vmm_model_arena* arena) {
+    if (arena == nullptr) {
+        return;
+    }
+    std::scoped_lock lock(pressure_mutex);
+    for (const ModelArenaPressureEntry& entry : pressure_model_arenas) {
+        if (entry.arena == arena) {
+            return;
+        }
+    }
+    pressure_model_arenas.push_back({arena});
+}
+
+void unregister_model_arena_pressure(ddo_vmm_model_arena* arena) {
+    std::scoped_lock lock(pressure_mutex);
+    for (auto entry = pressure_model_arenas.begin(); entry != pressure_model_arenas.end(); ++entry) {
+        if (entry->arena == arena) {
+            pressure_model_arenas.erase(entry);
+            return;
+        }
+    }
 }
 
 }  // namespace
@@ -346,6 +669,7 @@ bool release_model_arena_page(ddo_vmm_model_arena* arena, size_t page_index) {
     if (page.allocation == 0) {
         return true;
     }
+    arena->evicted_pages += 1;
     const CUdeviceptr page_address = arena->address + page_index * arena->page_size;
     if (!checked(cuMemUnmap(page_address, arena->page_size), "cuMemUnmap")) {
         return false;
@@ -366,29 +690,27 @@ bool model_arena_evict_one(
     size_t protected_begin = std::numeric_limits<size_t>::max(),
     size_t protected_end = std::numeric_limits<size_t>::max()
 ) {
-    size_t selected = arena->pages.size();
-    for (size_t index = arena->pages.size(); index > 0; --index) {
-        const size_t page_index = index - 1;
-        if (protected_begin != std::numeric_limits<size_t>::max()
-            && protected_begin <= page_index && page_index < protected_end) {
-            continue;
-        }
-        const auto& page = arena->pages[page_index];
+    // Model weights are packed in observed execution order.  On pressure,
+    // preserve the contiguous low-address prefix and recover the newest
+    // eligible high-address page.  This is native arena policy, independent
+    // of Python hook order or residency hints.
+    for (size_t page_index = arena->pages.size(); page_index > 0; --page_index) {
+        const size_t candidate_index = page_index - 1;
+        const auto& page = arena->pages[candidate_index];
         if (page.allocation == 0 || page.pin_count != 0) {
             continue;
         }
-        if (selected == arena->pages.size() || page.last_touch < arena->pages[selected].last_touch) {
-            selected = page_index;
+        if (protected_begin != std::numeric_limits<size_t>::max()
+            && protected_begin <= candidate_index && candidate_index < protected_end) {
+            continue;
         }
-    }
-    if (selected == arena->pages.size()) {
+        if (release_model_arena_page(arena, candidate_index)) {
+            arena->tail_evictions += 1;
+            return true;
+        }
         return false;
     }
-    // Eviction only releases the physical allocation.  The virtual span
-    // remains fully faultable: a low-address eviction must never make later
-    // model weights permanently inaccessible.  Pressure is handled by the
-    // LRU resident set, not by shrinking the model's address range.
-    return release_model_arena_page(arena, selected);
+    return false;
 }
 
 void model_arena_limit_admission(
@@ -974,6 +1296,7 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_create(
     arena->pages.resize(page_count);
 
     *out_arena = arena.release();
+    register_model_arena_pressure(*out_arena);
     return DDO_VMM_SUCCESS;
 }
 
@@ -981,9 +1304,24 @@ extern "C" void ddo_vmm_model_arena_destroy(ddo_vmm_model_arena* arena) {
     if (arena == nullptr) {
         return;
     }
+    // Make the address unreachable to a concurrent allocator-pressure pass
+    // before releasing its virtual reservation or physical backing.
+    unregister_model_arena_pressure(arena);
+    std::unique_lock mutation_lock(arena->mutation_mutex);
     if (cuInit(0) == CUDA_SUCCESS) {
         CUcontext temporary_primary_context = nullptr;
         if (activate_model_arena_context(arena, &temporary_primary_context)) {
+            // Execution-buffer pages remain pinned, including during compute.
+            // Never release them before their native completion fence drains.
+            if (arena->compute_fence_recorded
+                && cuEventSynchronize(arena->compute_fence) != CUDA_SUCCESS) {
+                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+                return; // Retain backing on failure rather than free live data.
+            }
+            if (arena->compute_fence != nullptr) {
+                cuEventDestroy(arena->compute_fence);
+                arena->compute_fence = nullptr;
+            }
             for (size_t page_index = 0; page_index < arena->pages.size(); ++page_index) {
                 auto& page = arena->pages[page_index];
                 if (page.view_bootstrap_mapped) {
@@ -1006,6 +1344,7 @@ extern "C" void ddo_vmm_model_arena_destroy(ddo_vmm_model_arena* arena) {
             cuDevicePrimaryCtxRelease(arena->device_ordinal);
         }
     }
+    mutation_lock.unlock();
     delete arena;
 }
 
@@ -1014,6 +1353,10 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_prepare_view_range(
     size_t offset_bytes,
     size_t size_bytes
 ) {
+    std::unique_lock<std::mutex> mutation_lock;
+    if (arena != nullptr) {
+        mutation_lock = std::unique_lock<std::mutex>(arena->mutation_mutex);
+    }
     if (arena == nullptr || size_bytes == 0 || offset_bytes > arena->virtual_size
         || size_bytes > arena->virtual_size - offset_bytes) {
         last_error = "model arena view range is invalid";
@@ -1076,6 +1419,10 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_release_view_range(
     size_t offset_bytes,
     size_t size_bytes
 ) {
+    std::unique_lock<std::mutex> mutation_lock;
+    if (arena != nullptr) {
+        mutation_lock = std::unique_lock<std::mutex>(arena->mutation_mutex);
+    }
     if (arena == nullptr || size_bytes == 0 || offset_bytes > arena->virtual_size
         || size_bytes > arena->virtual_size - offset_bytes) {
         last_error = "model arena view range is invalid";
@@ -1112,6 +1459,10 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
     size_t size_bytes,
     uint64_t* out_signature
 ) {
+    std::unique_lock<std::mutex> mutation_lock;
+    if (arena != nullptr) {
+        mutation_lock = std::unique_lock<std::mutex>(arena->mutation_mutex);
+    }
     if (arena == nullptr || size_bytes == 0 || out_signature == nullptr) {
         last_error = "model arena range and signature output must be valid";
         return DDO_VMM_INVALID_ARGUMENT;
@@ -1127,7 +1478,8 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
         last_error = "model arena page range is invalid";
         return DDO_VMM_INVALID_ARGUMENT;
     }
-    if (begin_page >= arena->fault_ceiling_page) {
+    if (begin_page >= arena->fault_ceiling_page
+        || (arena->streaming_admission && end_page > arena->fault_ceiling_page)) {
         last_error = std::string("model arena admission boundary reached by ")
             + arena->admission_limit_reason;
         return DDO_VMM_OUT_OF_MEMORY;
@@ -1149,6 +1501,7 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
     for (size_t page_index = begin_page; page_index < end_page; ++page_index) {
         auto& page = arena->pages[page_index];
         if (page.allocation != 0) {
+            arena->reused_pages += 1;
             continue;
         }
         if (page.view_bootstrap_mapped) {
@@ -1158,15 +1511,23 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
             }
             page.view_bootstrap_mapped = false;
         }
-        // A sequential model pass with a resident set smaller than the model
-        // must retain the already admitted prefix. Replacing it page by page
-        // would guarantee a full re-upload on the next pass. The caller uses
-        // a short-lived ordinary CUDA tensor for ranges beyond this boundary.
-        if (page_index >= arena->fault_ceiling_page || !model_arena_can_admit_page(arena)) {
-            model_arena_limit_admission(arena, page_index, "resident capacity");
-            last_error = "model arena admission boundary reached by resident capacity";
+        if (page_index >= arena->fault_ceiling_page) {
+            last_error = std::string("model arena admission boundary reached by ")
+                + arena->admission_limit_reason;
             release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
             return DDO_VMM_OUT_OF_MEMORY;
+        }
+        // A capacity budget limits physical residency, not the virtual model
+        // address span. Once an execution event has released an older pin,
+        // reuse its least-recently-used page for the current range. If every
+        // page is still in flight, report a recoverable capacity condition so
+        // the adapter can retire precisely one completed CUDA event.
+        while (!model_arena_can_admit_page(arena)) {
+            if (!model_arena_evict_one(arena, begin_page, end_page)) {
+                last_error = "model arena admission boundary reached by resident capacity";
+                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+                return DDO_VMM_OUT_OF_MEMORY;
+            }
         }
         if (!make_dxgi_budget_room(
             arena->device_ordinal, arena->page_size, arena->backing_kind, true
@@ -1209,18 +1570,46 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
         page.allocation = allocation;
         page.generation += 1;
         arena->resident_pages += 1;
+        arena->materialized_pages += 1;
     }
 
     uint64_t signature = 0x1234abcd5678ef00ULL;
-    const uint64_t touch = ++pressure_clock;
     for (size_t page_index = begin_page; page_index < end_page; ++page_index) {
         auto& page = arena->pages[page_index];
         page.pin_count += 1;
-        page.last_touch = touch;
         signature = mix_signature(signature, static_cast<uint64_t>(page_index), page.generation);
     }
     *out_signature = signature;
     release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_model_arena_peek_range_signature(
+    ddo_vmm_model_arena* arena, size_t offset_bytes, size_t size_bytes,
+    uint64_t* out_signature, int* out_resident
+) {
+    if (!arena || !out_signature || !out_resident || !size_bytes) {
+        last_error = "model arena observation requires a valid range and outputs";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(arena->mutation_mutex);
+    if (offset_bytes > arena->virtual_size || size_bytes > arena->virtual_size - offset_bytes) {
+        last_error = "model arena observation is outside the reserved address span";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    *out_signature = 0;
+    *out_resident = 0;
+    const size_t begin = model_arena_page_begin(arena, offset_bytes);
+    const size_t end = model_arena_page_end(arena, offset_bytes, size_bytes);
+    uint64_t signature = 0x1234abcd5678ef00ULL;
+    for (size_t index = begin; index < end; ++index) {
+        const auto& page = arena->pages[index];
+        if (!page.allocation) return DDO_VMM_SUCCESS;
+        signature = mix_signature(signature, static_cast<uint64_t>(index), page.generation);
+    }
+    *out_signature = signature;
+    *out_resident = 1;
+    last_error.clear();
     return DDO_VMM_SUCCESS;
 }
 
@@ -1274,11 +1663,405 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_copy_from_host_async(
     }
     return DDO_VMM_SUCCESS;
 }
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_copy_to_arena_async(
+    ddo_vmm_host_ring* ring,
+    size_t slot_index,
+    size_t slot_offset_bytes,
+    ddo_vmm_model_arena* arena,
+    size_t arena_offset_bytes,
+    size_t size_bytes,
+    void* cuda_stream
+) {
+    if (ring == nullptr || arena == nullptr || slot_index >= ring->slots.size() || size_bytes == 0 ||
+        slot_offset_bytes > ring->slot_size || size_bytes > ring->slot_size - slot_offset_bytes ||
+        arena_offset_bytes > arena->virtual_size || size_bytes > arena->virtual_size - arena_offset_bytes) {
+        last_error = "host ring copy arguments are outside their declared ranges";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    if (ring->device_ordinal != arena->device_ordinal) {
+        last_error = "host ring and model arena must use the same CUDA device";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[slot_index];
+    if (slot.read_busy()) {
+        last_error = "host ring source read must finish before DMA";
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    if (slot.in_flight && cuEventQuery(slot.completion) == CUDA_ERROR_NOT_READY) {
+        last_error = "host ring slot is still in flight";
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    slot.in_flight = false;
+    CUcontext temporary_primary_context = nullptr;
+    if (!activate_model_arena_context(arena, &temporary_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    const auto* source = static_cast<const unsigned char*>(slot.address) + slot_offset_bytes;
+    CUresult result = cuMemcpyHtoDAsync(
+        arena->address + arena_offset_bytes,
+        source,
+        size_bytes,
+        reinterpret_cast<CUstream>(cuda_stream)
+    );
+    if (result != CUDA_SUCCESS) {
+        release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+        set_error("cuMemcpyHtoDAsync(host ring)", result);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    result = cuEventRecord(slot.completion, reinterpret_cast<CUstream>(cuda_stream));
+    release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+    if (result != CUDA_SUCCESS) {
+        set_error("cuEventRecord(host ring)", result);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    slot.in_flight = true;
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_copy_ticket_to_arena_async(
+    ddo_vmm_host_ring* ring,
+    const size_t* slot_indices,
+    ddo_vmm_model_arena* arena,
+    const size_t* arena_offsets_bytes,
+    const size_t* sizes_bytes,
+    size_t range_count,
+    void* cuda_stream
+) {
+    if (ring == nullptr || arena == nullptr || slot_indices == nullptr || arena_offsets_bytes == nullptr
+        || sizes_bytes == nullptr || range_count == 0 || ring->device_ordinal != arena->device_ordinal) {
+        last_error = "host ring ticket copy arguments are invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    for (size_t index = 0; index < range_count; ++index) {
+        const size_t slot_index = slot_indices[index];
+        if (slot_index >= ring->slots.size() || sizes_bytes[index] == 0 || sizes_bytes[index] > ring->slot_size
+            || arena_offsets_bytes[index] > arena->virtual_size
+            || sizes_bytes[index] > arena->virtual_size - arena_offsets_bytes[index]) {
+            last_error = "host ring ticket range is outside its declared bounds";
+            return DDO_VMM_INVALID_ARGUMENT;
+        }
+        auto& slot = ring->slots[slot_index];
+        if (slot.in_flight && cuEventQuery(slot.completion) == CUDA_ERROR_NOT_READY) {
+            last_error = "host ring ticket slot is still in flight";
+            return DDO_VMM_OUT_OF_MEMORY;
+        }
+        slot.in_flight = false;
+    }
+    CUcontext temporary_primary_context = nullptr;
+    if (!activate_model_arena_context(arena, &temporary_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    for (size_t index = 0; index < range_count; ++index) {
+        auto& slot = ring->slots[slot_indices[index]];
+        // Do not form a source-ticket barrier here. As each registered slot
+        // becomes readable, immediately enqueue its H2D copy while later
+        // source windows continue on the native worker pool.
+        if (slot.read_in_flight) {
+            ddo_vmm_host_ring::FileReadResult read_result{};
+            try {
+                read_result = slot.file_read.get();
+            } catch (const std::exception&) {
+                slot.read_in_flight = false;
+                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+                last_error = "native shard source worker raised an exception";
+                return DDO_VMM_CUDA_ERROR;
+            }
+            slot.read_in_flight = false;
+            if (!read_result.succeeded) {
+                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+                last_error = read_result.error.empty() ? "native shard source worker failed" : read_result.error;
+                return DDO_VMM_CUDA_ERROR;
+            }
+        }
+        CUresult result = cuMemcpyHtoDAsync(
+            arena->address + arena_offsets_bytes[index], slot.address, sizes_bytes[index],
+            reinterpret_cast<CUstream>(cuda_stream)
+        );
+        if (result == CUDA_SUCCESS) {
+            result = cuEventRecord(slot.completion, reinterpret_cast<CUstream>(cuda_stream));
+        }
+        if (result != CUDA_SUCCESS) {
+            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+            set_error("native shard ticket H2D", result);
+            return DDO_VMM_CUDA_ERROR;
+        }
+        slot.in_flight = true;
+    }
+    release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_read_file_to_arena_async(
+    ddo_vmm_host_ring* ring,
+    size_t slot_index,
+    const char* path_utf8,
+    uint64_t file_offset_bytes,
+    ddo_vmm_model_arena* arena,
+    size_t arena_offset_bytes,
+    size_t size_bytes,
+    void* cuda_stream
+) {
+#if !defined(_WIN32)
+    (void)ring; (void)slot_index; (void)path_utf8; (void)file_offset_bytes;
+    (void)arena; (void)arena_offset_bytes; (void)size_bytes; (void)cuda_stream;
+    last_error = "native shard file transport is currently Windows-only";
+    return DDO_VMM_INVALID_ARGUMENT;
+#else
+    if (ring == nullptr || arena == nullptr || path_utf8 == nullptr || slot_index >= ring->slots.size() ||
+        size_bytes == 0 || size_bytes > ring->slot_size || arena_offset_bytes > arena->virtual_size ||
+        size_bytes > arena->virtual_size - arena_offset_bytes || ring->device_ordinal != arena->device_ordinal) {
+        last_error = "native shard transport arguments are invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    // Preserve this diagnostic convenience API, but route its source through
+    // the same persistent, positioned native transport used by real tickets.
+    // The wait is intentional here: callers requesting this combined API do
+    // not expose a source-read ticket to overlap with other work.
+    ddo_vmm_status status = ddo_vmm_host_ring_read_file_async(
+        ring, slot_index, path_utf8, file_offset_bytes, size_bytes
+    );
+    if (status != DDO_VMM_SUCCESS) {
+        return status;
+    }
+    status = ddo_vmm_host_ring_wait_file_read(ring, slot_index);
+    if (status != DDO_VMM_SUCCESS) {
+        return status;
+    }
+    return ddo_vmm_host_ring_copy_to_arena_async(
+        ring, slot_index, 0, arena, arena_offset_bytes, size_bytes, cuda_stream
+    );
+#endif
+}
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_read_file_async(
+    ddo_vmm_host_ring* ring, size_t slot_index, const char* path_utf8,
+    uint64_t file_offset_bytes, size_t size_bytes
+) {
+#if !defined(_WIN32)
+    (void)ring; (void)slot_index; (void)path_utf8; (void)file_offset_bytes; (void)size_bytes;
+    last_error = "native shard file transport is currently Windows-only";
+    return DDO_VMM_INVALID_ARGUMENT;
+#else
+    if (ring == nullptr || path_utf8 == nullptr || slot_index >= ring->slots.size() || size_bytes == 0 || size_bytes > ring->slot_size) {
+        last_error = "native shard read arguments are invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[slot_index];
+    if (ring->closing || slot.read_busy() || (slot.in_flight && cuEventQuery(slot.completion) == CUDA_ERROR_NOT_READY)) {
+        last_error = "native shard slot is not reusable";
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    const std::string path(path_utf8);
+    HANDLE file = INVALID_HANDLE_VALUE;
+    const auto existing = ring->shard_files.find(path);
+    if (existing != ring->shard_files.end()) {
+        file = existing->second;
+    } else {
+        file = open_native_shard_file(path_utf8);
+        if (file == INVALID_HANDLE_VALUE) {
+            return DDO_VMM_CUDA_ERROR;
+        }
+        ring->shard_files.emplace(path, file);
+    }
+    return enqueue_source_read_locked(ring, slot, file, file_offset_bytes, size_bytes);
+#endif
+}
+
+#if defined(_WIN32)
+ddo_vmm_status ddo_source_io::read_source_async(
+    ddo_vmm_host_ring* ring, size_t slot_index, const ddo_vmm_source_file* source,
+    uint64_t offset, size_t size
+) {
+    if (!ring || !source || slot_index >= ring->slots.size() || !size || size > ring->slot_size)
+        return DDO_VMM_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[slot_index];
+    if (ring->closing || slot.read_busy() || slot.in_flight) return DDO_VMM_BUSY;
+    return enqueue_source_read_locked(ring, slot, source_handle(source), offset, size);
+}
+#endif
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_wait_file_read(ddo_vmm_host_ring* ring, size_t slot_index) {
+    if (ring == nullptr || slot_index >= ring->slots.size()) {
+        last_error = "native shard read slot is invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    std::unique_lock<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[slot_index];
+    if (ring->closing) return DDO_VMM_BUSY;
+    if (!slot.read_busy()) return DDO_VMM_SUCCESS;
+    ddo_vmm_host_ring::FileReadResult result{};
+    try {
+#if defined(DDO_VMM_NATIVE_SOURCE_DISPATCHER)
+        result = ddo_source_io::wait_read_without_ring_lock(
+            slot, lock, ring->read_waiters_retired);
+#else
+        result = slot.file_read.get();
+#endif
+    } catch (const std::exception&) {
+        slot.read_in_flight = false;
+        last_error = "native shard asynchronous file read raised an exception";
+        return DDO_VMM_CUDA_ERROR;
+    }
+    slot.read_in_flight = false;
+    if (!result.succeeded) {
+        last_error = result.error.empty() ? "native shard asynchronous file read failed" : result.error;
+        return DDO_VMM_CUDA_ERROR;
+    }
+    return DDO_VMM_SUCCESS;
+}
+
+/* Source queue implementation is shared by the ring and persistent cache. */
+#if defined(_WIN32)
+ddo_vmm_status enqueue_source_read_locked(
+    ddo_vmm_host_ring* ring, ddo_vmm_host_ring::Slot& slot,
+    HANDLE file, uint64_t file_offset_bytes, size_t size_bytes
+) {
+    const size_t chunk_count = (size_bytes + kNativeSourceChunkBytes - 1) / kNativeSourceChunkBytes;
+    auto completion = std::make_shared<ddo_vmm_host_ring::FileReadCompletion>();
+    completion->pending_chunks.store(chunk_count, std::memory_order_release);
+#if defined(DDO_VMM_NATIVE_SOURCE_DISPATCHER)
+    slot.file_read = completion->promise.get_future().share();
+#else
+    slot.file_read = completion->promise.get_future();
+#endif
+    slot.read_in_flight = true;
+    size_t source_offset = 0;
+    try {
+    while (source_offset < size_bytes) {
+        const size_t chunk_size = std::min(kNativeSourceChunkBytes, size_bytes - source_offset);
+        ddo_vmm_host_ring::FileReadTask task{};
+        task.file = file;
+        task.offset = file_offset_bytes + source_offset;
+        task.destination = static_cast<unsigned char*>(slot.address) + source_offset;
+        task.size = chunk_size;
+        task.completion = completion;
+        if (!enqueue_host_ring_source_task(ring, std::move(task))) {
+            last_error = "native shard source queue is unavailable";
+            while (source_offset < size_bytes) {
+                const size_t abandoned_size = std::min(kNativeSourceChunkBytes, size_bytes - source_offset);
+                complete_host_ring_source_read(completion, false, last_error);
+                source_offset += abandoned_size;
+            }
+            return DDO_VMM_OUT_OF_MEMORY;
+        }
+        source_offset += chunk_size;
+    }
+    } catch (...) {
+        // The successfully queued tasks still own their portions. Complete
+        // only the unscheduled portions so wait/close cannot hang forever.
+        last_error = "native shard source task allocation failed";
+        while (source_offset < size_bytes) {
+            const size_t chunk_size = std::min(kNativeSourceChunkBytes, size_bytes - source_offset);
+            complete_host_ring_source_read(completion, false, last_error);
+            source_offset += chunk_size;
+        }
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    return DDO_VMM_SUCCESS;
+}
+#endif
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_wait_slot_async(
+    ddo_vmm_host_ring* ring,
+    size_t slot_index,
+    void* cuda_stream
+) {
+    if (ring == nullptr || slot_index >= ring->slots.size()) {
+        last_error = "host ring wait slot is invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    const auto& slot = ring->slots[slot_index];
+    if (!slot.in_flight) {
+        return DDO_VMM_SUCCESS;
+    }
+    CUcontext temporary_primary_context = nullptr;
+    if (!ensure_context(ring->device_ordinal, &temporary_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    CUresult result = cuStreamWaitEvent(
+        reinterpret_cast<CUstream>(cuda_stream), slot.completion, 0
+    );
+    release_temporary_primary_context(ring->device_ordinal, temporary_primary_context);
+    if (result != CUDA_SUCCESS) {
+        set_error("cuStreamWaitEvent(host ring)", result);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_copy_batch_to_arena_async(
+    ddo_vmm_host_ring* ring,
+    size_t slot_index,
+    const size_t* slot_offsets_bytes,
+    ddo_vmm_model_arena* arena,
+    const size_t* arena_offsets_bytes,
+    const size_t* sizes_bytes,
+    size_t range_count,
+    void* cuda_stream
+) {
+    if (ring == nullptr || arena == nullptr || slot_index >= ring->slots.size() ||
+        slot_offsets_bytes == nullptr || arena_offsets_bytes == nullptr || sizes_bytes == nullptr ||
+        range_count == 0 || ring->device_ordinal != arena->device_ordinal) {
+        last_error = "host ring batch copy arguments are invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    for (size_t index = 0; index < range_count; ++index) {
+        if (sizes_bytes[index] == 0 || slot_offsets_bytes[index] > ring->slot_size ||
+            sizes_bytes[index] > ring->slot_size - slot_offsets_bytes[index] ||
+            arena_offsets_bytes[index] > arena->virtual_size ||
+            sizes_bytes[index] > arena->virtual_size - arena_offsets_bytes[index]) {
+            last_error = "host ring batch copy range is outside its declared span";
+            return DDO_VMM_INVALID_ARGUMENT;
+        }
+    }
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[slot_index];
+    if (slot.in_flight && cuEventQuery(slot.completion) == CUDA_ERROR_NOT_READY) {
+        last_error = "host ring slot is still in flight";
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    slot.in_flight = false;
+    CUcontext temporary_primary_context = nullptr;
+    if (!activate_model_arena_context(arena, &temporary_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    for (size_t index = 0; index < range_count; ++index) {
+        const auto* source = static_cast<const unsigned char*>(slot.address) + slot_offsets_bytes[index];
+        CUresult result = cuMemcpyHtoDAsync(
+            arena->address + arena_offsets_bytes[index], source, sizes_bytes[index],
+            reinterpret_cast<CUstream>(cuda_stream)
+        );
+        if (result != CUDA_SUCCESS) {
+            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+            set_error("cuMemcpyHtoDAsync(host ring batch)", result);
+            return DDO_VMM_CUDA_ERROR;
+        }
+    }
+    CUresult result = cuEventRecord(slot.completion, reinterpret_cast<CUstream>(cuda_stream));
+    release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+    if (result != CUDA_SUCCESS) {
+        set_error("cuEventRecord(host ring batch)", result);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    slot.in_flight = true;
+    return DDO_VMM_SUCCESS;
+}
+
 extern "C" ddo_vmm_status ddo_vmm_model_arena_unpin_range(
     ddo_vmm_model_arena* arena,
     size_t offset_bytes,
     size_t size_bytes
 ) {
+    std::unique_lock<std::mutex> mutation_lock;
+    if (arena != nullptr) {
+        mutation_lock = std::unique_lock<std::mutex>(arena->mutation_mutex);
+    }
     if (arena == nullptr || size_bytes == 0) {
         last_error = "model arena range must be valid";
         return DDO_VMM_INVALID_ARGUMENT;
@@ -1307,6 +2090,10 @@ extern "C" uintptr_t ddo_vmm_model_arena_address(const ddo_vmm_model_arena* aren
     return arena == nullptr ? 0 : static_cast<uintptr_t>(arena->address);
 }
 
+extern "C" int ddo_vmm_model_arena_device_ordinal(const ddo_vmm_model_arena* arena) {
+    return arena == nullptr ? -1 : arena->device_ordinal;
+}
+
 extern "C" size_t ddo_vmm_model_arena_virtual_size(const ddo_vmm_model_arena* arena) {
     return arena == nullptr ? 0 : arena->virtual_size;
 }
@@ -1321,6 +2108,410 @@ extern "C" size_t ddo_vmm_model_arena_resident_size(const ddo_vmm_model_arena* a
 
 extern "C" size_t ddo_vmm_model_arena_fault_ceiling(const ddo_vmm_model_arena* arena) {
     return arena == nullptr ? 0 : arena->fault_ceiling_page * arena->page_size;
+}
+
+extern "C" uint64_t ddo_vmm_model_arena_materialized_pages(const ddo_vmm_model_arena* arena) {
+    return arena == nullptr ? 0 : arena->materialized_pages;
+}
+
+extern "C" uint64_t ddo_vmm_model_arena_reused_pages(const ddo_vmm_model_arena* arena) {
+    return arena == nullptr ? 0 : arena->reused_pages;
+}
+
+extern "C" uint64_t ddo_vmm_model_arena_evicted_pages(const ddo_vmm_model_arena* arena) {
+    return arena == nullptr ? 0 : arena->evicted_pages;
+}
+
+extern "C" size_t ddo_vmm_model_arena_resident_prefix_pages(const ddo_vmm_model_arena* arena) {
+    if (arena == nullptr) {
+        return 0;
+    }
+    size_t prefix_pages = 0;
+    while (prefix_pages < arena->pages.size() && arena->pages[prefix_pages].allocation != 0) {
+        ++prefix_pages;
+    }
+    return prefix_pages;
+}
+
+extern "C" uint64_t ddo_vmm_model_arena_tail_evictions(const ddo_vmm_model_arena* arena) {
+    return arena == nullptr ? 0 : arena->tail_evictions;
+}
+
+extern "C" uint64_t ddo_vmm_model_arena_pressure_evictions(const ddo_vmm_model_arena* arena) {
+    return arena == nullptr ? 0 : arena->pressure_evictions;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_create(
+    int device_ordinal,
+    size_t slot_size_bytes,
+    size_t slot_count,
+    ddo_vmm_host_ring** out_ring
+) {
+    if (out_ring == nullptr || slot_size_bytes == 0 || slot_count == 0) {
+        last_error = "host ring output, slot size, and slot count must be valid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    *out_ring = nullptr;
+    // Legacy staging remains admissible independently of experimental cache
+    // caps. Serialize registration so cache cannot admit against a stale total.
+    std::lock_guard<std::mutex> accounting_lock(ddo_host_accounting::mutex);
+    if (slot_count > (std::numeric_limits<uint64_t>::max()
+            - ddo_host_accounting::staging_registered_bytes) / slot_size_bytes) {
+        last_error = "host ring accounting size overflow";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    const uint64_t requested_bytes = slot_size_bytes * slot_count;
+    const uint64_t cache_limit = ddo_host_accounting::active_cache_limit_bytes;
+    if (cache_limit != std::numeric_limits<uint64_t>::max()) {
+        const uint64_t cache_bytes = ddo_host_accounting::cache_committed_bytes;
+        const uint64_t staging_bytes = ddo_host_accounting::staging_registered_bytes;
+        if (cache_bytes > cache_limit || staging_bytes > cache_limit - cache_bytes
+            || requested_bytes > cache_limit - cache_bytes - staging_bytes) {
+            last_error = "host ring would exceed the active source-cache process limit";
+            return DDO_VMM_OUT_OF_MEMORY;
+        }
+#if defined(_WIN32)
+        MEMORYSTATUSEX memory{};
+        memory.dwLength = sizeof(memory);
+        const uint64_t headroom = ddo_host_accounting::active_cache_headroom_bytes;
+        if (!GlobalMemoryStatusEx(&memory) || requested_bytes > memory.ullAvailPhys
+            || requested_bytes > memory.ullAvailPageFile
+            || headroom > memory.ullAvailPhys - requested_bytes
+            || headroom > memory.ullAvailPageFile - requested_bytes) {
+            last_error = "host ring registration would breach source-cache RAM/commit headroom";
+            return DDO_VMM_OUT_OF_MEMORY;
+        }
+#endif
+    }
+    CUcontext retained_primary_context = nullptr;
+    if (!ensure_context(device_ordinal, &retained_primary_context)) {
+        return DDO_VMM_CUDA_ERROR;
+    }
+    auto ring = std::make_unique<ddo_vmm_host_ring>();
+    ring->device_ordinal = device_ordinal;
+    ring->slot_size = slot_size_bytes;
+    ring->slots.reserve(slot_count);
+    for (size_t index = 0; index < slot_count; ++index) {
+        ddo_vmm_host_ring::Slot slot{};
+#if defined(_WIN32)
+        slot.address = VirtualAlloc(nullptr, slot_size_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (slot.address != nullptr
+            && checked(cuMemHostRegister(slot.address, slot_size_bytes, CU_MEMHOSTREGISTER_PORTABLE), "cuMemHostRegister")) {
+            slot.virtual_memory_registered = true;
+        }
+        if (!slot.virtual_memory_registered ||
+#else
+        if (!checked(cuMemHostAlloc(&slot.address, slot_size_bytes, CU_MEMHOSTALLOC_PORTABLE), "cuMemHostAlloc") ||
+#endif
+            !checked(cuEventCreate(&slot.completion, CU_EVENT_DISABLE_TIMING), "cuEventCreate(host ring)")) {
+            if (slot.completion != nullptr) {
+                cuEventDestroy(slot.completion);
+            }
+            if (slot.address != nullptr) {
+#if defined(_WIN32)
+                if (slot.virtual_memory_registered) {
+                    cuMemHostUnregister(slot.address);
+                }
+                VirtualFree(slot.address, 0, MEM_RELEASE);
+#else
+                cuMemFreeHost(slot.address);
+#endif
+            }
+            for (const auto& allocated : ring->slots) {
+                cuEventDestroy(allocated.completion);
+#if defined(_WIN32)
+                cuMemHostUnregister(allocated.address);
+                VirtualFree(allocated.address, 0, MEM_RELEASE);
+#else
+                cuMemFreeHost(allocated.address);
+#endif
+            }
+            release_temporary_primary_context(device_ordinal, retained_primary_context);
+            return DDO_VMM_CUDA_ERROR;
+        }
+        ring->slots.push_back(std::move(slot));
+    }
+#if defined(_WIN32)
+    if (!start_host_ring_source_workers(ring.get())) {
+        for (const auto& allocated : ring->slots) {
+            cuEventDestroy(allocated.completion);
+            cuMemHostUnregister(allocated.address);
+            VirtualFree(allocated.address, 0, MEM_RELEASE);
+        }
+        release_temporary_primary_context(device_ordinal, retained_primary_context);
+        return DDO_VMM_CUDA_ERROR;
+    }
+#endif
+    release_temporary_primary_context(device_ordinal, retained_primary_context);
+    ring->accounted_staging = true;
+    ddo_host_accounting::staging_registered_bytes += slot_size_bytes * slot_count;
+    *out_ring = ring.release();
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" void ddo_vmm_host_ring_destroy(ddo_vmm_host_ring* ring) {
+    if (ring == nullptr) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(ring->mutex);
+    ring->closing = true;
+    ring->read_waiters_retired.wait(lock, [&] {
+        return std::all_of(ring->slots.begin(), ring->slots.end(),
+                           [](const auto& slot) { return slot.read_waiters == 0; });
+    });
+    uint64_t released_staging = 0;
+    for (const auto& slot : ring->slots) {
+        if (slot.read_in_flight) {
+            slot.file_read.wait();
+        }
+        if (slot.in_flight) {
+            cuEventSynchronize(slot.completion);
+        }
+        if (slot.completion) cuEventDestroy(slot.completion);
+#if defined(_WIN32)
+        if (slot.virtual_memory_registered) {
+            if (cuMemHostUnregister(slot.address) == CUDA_SUCCESS && ring->accounted_staging)
+                released_staging += ring->slot_size;
+        }
+        if (slot.address) VirtualFree(slot.address, 0, MEM_RELEASE);
+#else
+        if (slot.address && cuMemFreeHost(slot.address) == CUDA_SUCCESS && ring->accounted_staging)
+            released_staging += ring->slot_size;
+#endif
+    }
+#if defined(_WIN32)
+    stop_host_ring_source_workers(ring);
+    for (const auto& [path, file] : ring->shard_files) {
+        (void)path;
+        CloseHandle(file);
+    }
+    ring->shard_files.clear();
+#endif
+    lock.unlock();  // The mutex must outlive its lock guard.
+    {
+        std::lock_guard<std::mutex> accounting_lock(ddo_host_accounting::mutex);
+        ddo_host_accounting::staging_registered_bytes -= released_staging;
+    }
+    delete ring;
+}
+
+#if defined(_WIN32)
+ddo_vmm_status ddo_source_io::create_lazy_ring(
+    int device, size_t slot_bytes, size_t slots, ddo_vmm_host_ring** output
+) {
+    if (!output || !slot_bytes || !slots) return DDO_VMM_INVALID_ARGUMENT;
+    *output = nullptr;
+    auto ring = std::make_unique<ddo_vmm_host_ring>();
+    ring->device_ordinal = device;
+    ring->slot_size = slot_bytes;
+    ring->slots.resize(slots);
+    if (!start_host_ring_source_workers(ring.get())) return DDO_VMM_INTERNAL_ERROR;
+    *output = ring.release();
+    return DDO_VMM_SUCCESS;
+}
+
+bool ddo_source_io::source_read_complete(ddo_vmm_host_ring* ring, size_t index) {
+    if (!ring || index >= ring->slots.size()) return true;
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    const auto& slot = ring->slots[index];
+    if (!slot.read_in_flight) return true;
+    // An exceptional/invalid completion must reach the draining error path,
+    // never masquerade as successful entry readiness.
+    return !slot.file_read.valid()
+        || slot.file_read.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
+
+ddo_vmm_status ddo_source_io::commit_storage(ddo_vmm_host_ring* ring, size_t index) {
+    if (!ring || index >= ring->slots.size()) return DDO_VMM_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[index];
+    if (ring->closing) return DDO_VMM_BUSY;
+    if (slot.address) return DDO_VMM_SUCCESS;
+    CUevent event = nullptr;
+    if (!checked(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING), "cuEventCreate(cache slot)"))
+        return DDO_VMM_CUDA_ERROR;
+    void* address = VirtualAlloc(nullptr, ring->slot_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!address) {
+        cuEventDestroy(event);
+        last_error = "progressive host slot commit failed";
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    slot.address = address;
+    slot.completion = event;
+    return DDO_VMM_SUCCESS;
+}
+
+ddo_vmm_status ddo_source_io::register_storage(ddo_vmm_host_ring* ring, size_t index) {
+    if (!ring || index >= ring->slots.size()) return DDO_VMM_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[index];
+    if (ring->closing || !slot.address || slot.read_busy() || slot.in_flight) return DDO_VMM_BUSY;
+    if (slot.virtual_memory_registered) return DDO_VMM_SUCCESS;
+    const auto result = cuMemHostRegister(slot.address, ring->slot_size, CU_MEMHOSTREGISTER_PORTABLE);
+    if (!checked(result, "cuMemHostRegister(persistent storage)"))
+        return result == CUDA_ERROR_OUT_OF_MEMORY ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
+    slot.virtual_memory_registered = true;
+    return DDO_VMM_SUCCESS;
+}
+
+ddo_vmm_status ddo_source_io::unregister_storage(ddo_vmm_host_ring* ring, size_t index) {
+    if (!ring || index >= ring->slots.size()) return DDO_VMM_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[index];
+    if (ring->closing || slot.read_busy() || slot.in_flight) return DDO_VMM_BUSY;
+    if (slot.virtual_memory_registered) {
+        if (!checked(cuMemHostUnregister(slot.address), "cuMemHostUnregister(persistent storage)"))
+            return DDO_VMM_CUDA_ERROR;
+        slot.virtual_memory_registered = false;
+    }
+    return DDO_VMM_SUCCESS;
+}
+
+ddo_vmm_status ddo_source_io::commit_slot(ddo_vmm_host_ring* ring, size_t index) {
+    auto status = commit_storage(ring, index);
+    if (status != DDO_VMM_SUCCESS) return status;
+    status = register_storage(ring, index);
+    if (status != DDO_VMM_SUCCESS) release_slot(ring, index);
+    return status;
+}
+
+ddo_vmm_status ddo_source_io::stage_host_bytes(ddo_vmm_host_ring* ring, size_t index, const void* bytes, size_t size) {
+    if (!ring || index >= ring->slots.size() || !bytes || !size || size > ring->slot_size)
+        return DDO_VMM_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[index];
+    if (ring->closing || !slot.address || !slot.virtual_memory_registered || slot.read_busy())
+        return DDO_VMM_BUSY;
+    if (slot.in_flight) {
+        const auto result = cuEventQuery(slot.completion);
+        if (result == CUDA_ERROR_NOT_READY) return DDO_VMM_BUSY;
+        if (!checked(result, "cuEventQuery(retained-source fallback slot)")) return DDO_VMM_CUDA_ERROR;
+        slot.in_flight = false;
+    }
+    std::memcpy(slot.address, bytes, size);
+    return DDO_VMM_SUCCESS;
+}
+
+ddo_vmm_status ddo_source_io::release_slot(ddo_vmm_host_ring* ring, size_t index) {
+    if (!ring || index >= ring->slots.size()) return DDO_VMM_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[index];
+    if (ring->closing || slot.read_busy() || slot.in_flight) return DDO_VMM_BUSY;
+    if (slot.completion) {
+        if (!checked(cuEventDestroy(slot.completion), "cuEventDestroy(cache slot)")) return DDO_VMM_CUDA_ERROR;
+        slot.completion = nullptr;
+    }
+    if (slot.virtual_memory_registered) {
+        if (!checked(cuMemHostUnregister(slot.address), "cuMemHostUnregister(cache slot)")) return DDO_VMM_CUDA_ERROR;
+        slot.virtual_memory_registered = false;
+    }
+    if (slot.address) {
+        if (!VirtualFree(slot.address, 0, MEM_RELEASE)) {
+            last_error = "progressive host slot release failed";
+            return DDO_VMM_INTERNAL_ERROR;
+        }
+        slot.address = nullptr;
+    }
+    return DDO_VMM_SUCCESS;
+}
+#endif
+
+extern "C" size_t ddo_vmm_host_ring_slot_size(const ddo_vmm_host_ring* ring) {
+    return ring == nullptr ? 0 : ring->slot_size;
+}
+
+extern "C" size_t ddo_vmm_host_ring_slot_count(const ddo_vmm_host_ring* ring) {
+    return ring == nullptr ? 0 : ring->slots.size();
+}
+
+extern "C" size_t ddo_vmm_host_ring_source_worker_count(const ddo_vmm_host_ring* ring) {
+#if defined(_WIN32)
+    return ring == nullptr ? 0 : ring->source_workers.size();
+#else
+    (void)ring;
+    return 0;
+#endif
+}
+
+extern "C" uint64_t ddo_vmm_host_ring_source_read_chunks(const ddo_vmm_host_ring* ring) {
+#if defined(_WIN32)
+    return ring == nullptr ? 0 : ring->source_read_chunks.load(std::memory_order_relaxed);
+#else
+    (void)ring;
+    return 0;
+#endif
+}
+
+extern "C" uint64_t ddo_vmm_host_ring_source_read_bytes(const ddo_vmm_host_ring* ring) {
+#if defined(_WIN32)
+    return ring == nullptr ? 0 : ring->source_read_bytes.load(std::memory_order_relaxed);
+#else
+    (void)ring;
+    return 0;
+#endif
+}
+
+extern "C" uint64_t ddo_vmm_host_ring_source_read_failures(const ddo_vmm_host_ring* ring) {
+#if defined(_WIN32)
+    return ring == nullptr ? 0 : ring->source_read_failures.load(std::memory_order_relaxed);
+#else
+    (void)ring;
+    return 0;
+#endif
+}
+
+extern "C" uintptr_t ddo_vmm_host_ring_slot_address(const ddo_vmm_host_ring* ring, size_t slot_index) {
+    if (ring == nullptr || slot_index >= ring->slots.size()) {
+        return 0;
+    }
+    return reinterpret_cast<uintptr_t>(ring->slots[slot_index].address);
+}
+
+extern "C" int ddo_vmm_host_ring_slot_ready(ddo_vmm_host_ring* ring, size_t slot_index) {
+    if (ring == nullptr || slot_index >= ring->slots.size()) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[slot_index];
+    if (slot.read_busy()) {
+        return 0;
+    }
+    if (!slot.in_flight) {
+        return 1;
+    }
+    CUresult result = cuEventQuery(slot.completion);
+    if (result == CUDA_SUCCESS) {
+        slot.in_flight = false;
+        return 1;
+    }
+    if (result == CUDA_ERROR_NOT_READY) {
+        return 0;
+    }
+    set_error("cuEventQuery(host ring)", result);
+    return 0;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_host_ring_wait_slot(ddo_vmm_host_ring* ring, size_t slot_index) {
+    if (ring == nullptr || slot_index >= ring->slots.size()) {
+        last_error = "host ring wait slot is invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(ring->mutex);
+    auto& slot = ring->slots[slot_index];
+    if (slot.read_busy()) {
+        last_error = "host ring source read must finish before slot reuse";
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    if (!slot.in_flight) {
+        return DDO_VMM_SUCCESS;
+    }
+    CUresult result = cuEventSynchronize(slot.completion);
+    if (result != CUDA_SUCCESS) {
+        set_error("cuEventSynchronize(host ring)", result);
+        return DDO_VMM_CUDA_ERROR;
+    }
+    slot.in_flight = false;
+    return DDO_VMM_SUCCESS;
 }
 
 extern "C" void ddo_vmm_pressure_register(ddo_vmm_region* region) {
@@ -1360,6 +2551,31 @@ extern "C" void ddo_vmm_pressure_touch(ddo_vmm_region* region) {
 
 extern "C" int ddo_vmm_pressure_evict_one(int device_ordinal) {
     std::scoped_lock lock(pressure_mutex);
+    // This is reached from the allocator that owns ordinary PyTorch CUDA
+    // allocations.  Release an eligible model page first, retaining the
+    // arena's virtual address and its contiguous low-address prefix. A
+    // try-lock avoids waiting behind the exact model operation that may have
+    // initiated the allocation request.
+    for (const ModelArenaPressureEntry& entry : pressure_model_arenas) {
+        ddo_vmm_model_arena* arena = entry.arena;
+        if (arena == nullptr || arena->device_ordinal != device_ordinal) {
+            continue;
+        }
+        std::unique_lock<std::mutex> arena_lock(arena->mutation_mutex, std::try_to_lock);
+        if (!arena_lock.owns_lock() || arena->resident_pages == 0) {
+            continue;
+        }
+        CUcontext temporary_primary_context = nullptr;
+        if (!activate_model_arena_context(arena, &temporary_primary_context)) {
+            continue;
+        }
+        const bool evicted = model_arena_evict_one(arena);
+        release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+        if (evicted) {
+            arena->pressure_evictions += 1;
+            return 1;
+        }
+    }
     PressureEntry* selected = nullptr;
     for (PressureEntry& entry : pressure_entries) {
         if (
@@ -1380,6 +2596,26 @@ extern "C" int ddo_vmm_pressure_evict_one(int device_ordinal) {
     }
     selected->touch = ++pressure_clock;
     return 1;
+}
+
+extern "C" ddo_vmm_status ddo_vmm_pressure_prepare_cuda_allocation(
+    int device_ordinal,
+    size_t required_bytes
+) {
+    if (device_ordinal < 0 || required_bytes == 0) {
+        last_error = "CUDA allocation pressure arguments are invalid";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    // With no configured WDDM reserve this is deliberately a no-op. The
+    // allocation path still has its OOM retry below, avoiding speculative
+    // eviction during ordinary steady-state work.
+    if (!make_dxgi_budget_room(
+        device_ordinal, required_bytes, DDO_VMM_BACKING_DEVICE, false
+    )) {
+        last_error = "native VMM could not restore CUDA allocation headroom";
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+    return DDO_VMM_SUCCESS;
 }
 
 extern "C" ddo_vmm_status ddo_vmm_windows_memory_query(
@@ -1424,6 +2660,162 @@ extern "C" ddo_vmm_status ddo_vmm_dxgi_budget_guard_set(
         device_ordinal,
         {local_reserve_bytes, shared_reserve_bytes, system_reserve_bytes},
     });
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" int ddo_vmm_model_arena_enable_streaming(
+    ddo_vmm_model_arena* arena, size_t execution_buffer_bytes
+) {
+    if (!arena || !execution_buffer_bytes) return DDO_VMM_INVALID_ARGUMENT;
+    std::scoped_lock lock(arena->mutation_mutex);
+    const size_t pages = execution_buffer_bytes / arena->page_size
+        + (execution_buffer_bytes % arena->page_size != 0);
+    const size_t budget_pages = arena->resident_budget / arena->page_size;
+    if (arena->streaming_admission || arena->resident_pages || pages >= budget_pages) {
+        last_error = "execution buffer requires unused arena and room within residency ceiling";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    arena->resident_budget = (budget_pages - pages) * arena->page_size;
+    arena->fault_ceiling_page = std::min(arena->pages.size(), budget_pages - pages);
+    arena->admission_limit_reason = "native streaming limit";
+    arena->streaming_admission = true;
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" int ddo_vmm_model_arena_record_compute(ddo_vmm_model_arena* arena, void* stream) {
+    if (!arena) return DDO_VMM_INVALID_ARGUMENT;
+    std::scoped_lock lock(arena->mutation_mutex);
+    CUcontext temporary = nullptr;
+    if (!activate_model_arena_context(arena, &temporary)) return DDO_VMM_CUDA_ERROR;
+    bool ok = true;
+    if (!arena->compute_fence)
+        ok = checked(cuEventCreate(&arena->compute_fence, CU_EVENT_DISABLE_TIMING), "execution event create");
+    if (ok) ok = checked(cuEventRecord(arena->compute_fence, static_cast<CUstream>(stream)), "execution event record");
+    if (ok) arena->compute_fence_recorded = true;
+    release_temporary_primary_context(arena->device_ordinal, temporary);
+    return ok ? DDO_VMM_SUCCESS : DDO_VMM_CUDA_ERROR;
+}
+
+extern "C" int ddo_vmm_model_arena_wait_compute(ddo_vmm_model_arena* arena, void* stream) {
+    if (!arena) return DDO_VMM_INVALID_ARGUMENT;
+    std::scoped_lock lock(arena->mutation_mutex);
+    if (!arena->compute_fence_recorded) return DDO_VMM_SUCCESS;
+    CUcontext temporary = nullptr;
+    if (!activate_model_arena_context(arena, &temporary)) return DDO_VMM_CUDA_ERROR;
+    bool ok;
+    {
+        ddo_vmm_detail::TimelineScope timing(3, reinterpret_cast<uintptr_t>(arena), 0, stream);
+        ok = checked(cuStreamWaitEvent(static_cast<CUstream>(stream), arena->compute_fence, 0), "execution buffer reuse wait");
+    }
+    release_temporary_primary_context(arena->device_ordinal, temporary);
+    return ok ? DDO_VMM_SUCCESS : DDO_VMM_CUDA_ERROR;
+}
+
+extern "C" int ddo_vmm_model_arena_drain_compute(ddo_vmm_model_arena* arena) {
+    if (!arena) return DDO_VMM_INVALID_ARGUMENT;
+    std::scoped_lock lock(arena->mutation_mutex);
+    if (!arena->compute_fence_recorded) return DDO_VMM_SUCCESS;
+    CUcontext temporary = nullptr;
+    if (!activate_model_arena_context(arena, &temporary)) return DDO_VMM_CUDA_ERROR;
+    const bool ok = checked(cuEventSynchronize(arena->compute_fence), "execution buffer close wait");
+    release_temporary_primary_context(arena->device_ordinal, temporary);
+    return ok ? DDO_VMM_SUCCESS : DDO_VMM_CUDA_ERROR;
+}
+
+extern "C" int ddo_vmm_execution_pool_create(ddo_vmm_model_arena* model,
+    size_t slot_bytes, size_t slot_count, ddo_vmm_execution_pool** output) {
+    if (!output) return DDO_VMM_INVALID_ARGUMENT;
+    *output = nullptr;
+    if (!model || !slot_bytes || slot_count < 2 || slot_count > 4)
+        return DDO_VMM_INVALID_ARGUMENT;
+    const size_t capacity = align_up(slot_bytes, model->page_size);
+    if (!capacity || capacity > model->resident_budget / slot_count
+        || capacity * slot_count >= model->resident_budget) {
+        last_error = "execution slots must fit inside existing weight residency ceiling";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+    try {
+        auto pool = std::make_unique<ddo_vmm_execution_pool>();
+        pool->slots.resize(slot_count);
+        for (auto& slot : pool->slots) {
+            auto status = ddo_vmm_model_arena_create(model->device_ordinal, capacity,
+                capacity, model->page_size, model->backing_kind, &slot.arena);
+            if (status != DDO_VMM_SUCCESS) {
+                return status;
+            }
+        }
+        auto status = ddo_vmm_model_arena_enable_streaming(model, capacity * slot_count);
+        if (status != DDO_VMM_SUCCESS) {
+            return status;
+        }
+        *output = pool.release();
+        return DDO_VMM_SUCCESS;
+    } catch (...) {
+        last_error = "execution slot metadata allocation failed";
+        return DDO_VMM_OUT_OF_MEMORY;
+    }
+}
+
+extern "C" int ddo_vmm_execution_pool_acquire(ddo_vmm_execution_pool* pool,
+    void* upload_stream, size_t* index, ddo_vmm_model_arena** arena) {
+    if (!pool || !index || !arena) return DDO_VMM_INVALID_ARGUMENT;
+    *arena = nullptr;
+    std::scoped_lock lock(pool->mutex);
+    for (size_t step = 0; step < pool->slots.size(); ++step) {
+        const size_t candidate = (pool->next + step) % pool->slots.size();
+        auto& slot = pool->slots[candidate];
+        if (slot.leased) continue;
+        auto status = ddo_vmm_model_arena_wait_compute(slot.arena, upload_stream);
+        if (status != DDO_VMM_SUCCESS) return status;
+        if (!slot.materialized) {
+            uint64_t signature = 0;
+            status = ddo_vmm_model_arena_fault_range(slot.arena, 0,
+                slot.arena->virtual_size, &signature);
+            if (status != DDO_VMM_SUCCESS) return status;
+            slot.materialized = true; // Permanently pin; only close releases.
+        }
+        slot.leased = true;
+        pool->next = (candidate + 1) % pool->slots.size();
+        *index = candidate;
+        *arena = slot.arena;
+        return DDO_VMM_SUCCESS;
+    }
+    last_error = "all native execution slots still have live consumers";
+    return DDO_VMM_BUSY;
+}
+
+extern "C" int ddo_vmm_execution_pool_release(ddo_vmm_execution_pool* pool,
+    size_t index, void* last_use_stream) {
+    if (!pool || index >= pool->slots.size()) return DDO_VMM_INVALID_ARGUMENT;
+    std::scoped_lock lock(pool->mutex);
+    auto& slot = pool->slots[index];
+    if (!slot.leased) return DDO_VMM_INVALID_ARGUMENT;
+    auto status = ddo_vmm_model_arena_record_compute(slot.arena, last_use_stream);
+    if (status == DDO_VMM_SUCCESS) slot.leased = false;
+    return status; // On event failure the lease remains owned, never reusable.
+}
+
+extern "C" int ddo_vmm_execution_pool_close(ddo_vmm_execution_pool** owner) {
+    if (!owner) return DDO_VMM_INVALID_ARGUMENT;
+    auto* pool = *owner;
+    if (!pool) return DDO_VMM_SUCCESS;
+    {
+        std::scoped_lock lock(pool->mutex);
+        for (const auto& slot : pool->slots) {
+            if (slot.leased) {
+                last_error = "execution pool still has live slot leases";
+                return DDO_VMM_BUSY;
+            }
+            auto status = ddo_vmm_model_arena_drain_compute(slot.arena);
+            if (status != DDO_VMM_SUCCESS) return status;
+        }
+        for (auto& slot : pool->slots) {
+            ddo_vmm_model_arena_destroy(slot.arena);
+            slot.arena = nullptr;
+        }
+    }
+    delete pool;
+    *owner = nullptr;
     return DDO_VMM_SUCCESS;
 }
 

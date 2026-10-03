@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.25)
+project(ddo_posix_source_contract LANGUAGES CXX)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "This CPU contract requires native Linux, not a simulated Windows build")
+endif()
+find_package(Threads REQUIRED)
+add_executable(ddo_posix_source_contract
+    ../posix_source_test.cpp
+    ../../src/ddo_vmm_source.cpp)
+target_compile_features(ddo_posix_source_contract PRIVATE cxx_std_20)
+target_compile_definitions(ddo_posix_source_contract PRIVATE _FILE_OFFSET_BITS=64)
+target_compile_options(ddo_posix_source_contract PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(ddo_posix_source_contract PRIVATE ../../include ../../src)
+target_link_libraries(ddo_posix_source_contract PRIVATE Threads::Threads)
+enable_testing()
+add_test(NAME posix_source_cpu COMMAND ddo_posix_source_contract)

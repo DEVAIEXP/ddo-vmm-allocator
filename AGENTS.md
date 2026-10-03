@@ -3,7 +3,7 @@
 ## Scope
 
 This subproject provides the native CUDA Driver VMM library and the PyTorch
-adapter used by the LTX host. This is an independent implementation; do not copy
+adapter consumed by DDO. This is an independent implementation; do not copy
 code from external projects.
 
 ## Target architecture
@@ -16,16 +16,33 @@ code from external projects.
   path remains supported for validated presets and experiments; do not remove it.
 - The native path uses `backing=device`; under WDDM the driver may place physical
   pages in shared memory under pressure, without switching to PyTorch's allocator.
-- Do not introduce a parallel safetensors cache or Python group heuristics:
-  residency and pressure belong to the native arena.
+- Persistent sources and the registered cache belong to C++ in this submodule.
+  Sources retain descriptors and native bytes, not loader CPU tensors. Do not
+  introduce a parallel safetensors cache or Python group heuristics: residency,
+  admission and pressure belong to the native runtime.
+- Host sources and GPU arenas have distinct lifetimes. A retained handle keeps
+  the file alive after its original owner closes. Closing an owner requires
+  serialization with calls on that same handle; retained owners allow concurrent
+  reads. The future cache may recycle bytes only after I/O and every referencing
+  DMA have completed.
+- In the persistent buffer (config v5 / ABI v8), host commitment and CUDA
+  registration have separate ceilings and lifetimes. Unregistration preserves
+  bytes; subsequent DMA can register them again without rereading the file.
+  Only host pressure/clear removes content. Registration policy and its events
+  belong to C++.
+- The persistent path uses two native execution slots charged against the
+  existing GPU ceiling and immutable batch descriptors. Recycling requires the
+  last consumer's event; cancellation requires the upload event. Partial failure
+  does not release ownership without proven completion. Python submits one unit,
+  rather than managing requests/DMAs per window; views may be reused.
 
 ## Safety rules
 
 1. Never deallocate/remap a region while a stream may reference it.
 2. Materialization failure must fall back to a temporary CUDA buffer and restore
    parameters only after the relevant stream synchronization/event.
-3. Native pressure eviction must consider only unpinned pages; the virtual
-   range remains fully faultable after eviction.
+3. Native pressure eviction must consider only unpinned pages; the virtual range
+   remains fully faultable after eviction.
 4. Every lifecycle change needs a small CUDA test before any LTX benchmark.
 
 ## Required tests
@@ -33,18 +50,22 @@ code from external projects.
 ```powershell
 $env:PYTHONPATH='E:\ProjetosIA\diffusers-dynamic-offloader\ddo-vmm-allocator\src'
 $env:DDO_VMM_LIBRARY_PATH='E:\ProjetosIA\diffusers-dynamic-offloader\ddo-vmm-allocator\build\Release\ddo_vmm.dll'
-& 'E:\ProjetosIA\ltx2.3-image-diffusers\.venv\Scripts\python.exe' -m pytest tests -q
+& 'E:\ProjetosIA\diffusers-dynamic-offloader\.venv-vmm\Scripts\python.exe' -m pytest tests -q
 ```
 
-The current baseline is `4 passed`. Rebuild the DLL using the user's MSVC prompt
-when changing `native/`.
+Present the command, hypothesis and approval criterion and wait for confirmation
+before any CUDA test or benchmark. `tests/test_native_source.py` tests only
+files/ownership, without initializing CUDA. Use DDO's `.venv-vmm` environment for
+both projects. Rebuild the DLL when changing `native/`; record actual gate
+results rather than treating historical test counts as the current baseline.
 
 ## Integration
 
-The DDO runner must use `attach_model_linear_modules` and pass the residency
-budget explicitly (or `None` to leave pressure to the driver).
-`linear_runtime` remains the compatibility route and must not silently
-redirect to the native arena.
+Hosts use DDO's public API, which consumes `attach_model_linear_modules`.
+During source gates, preserve the active 4 GiB budget and approved staging;
+the host cache has a separate ceiling and does not increase the GPU budget.
+`linear_runtime` remains the stable route and must not silently redirect to the
+native arena. `vmm_runtime` is the protected NVMe baseline.
 
 ## Regression prohibition
 
