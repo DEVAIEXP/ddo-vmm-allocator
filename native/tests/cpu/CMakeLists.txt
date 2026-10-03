@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.25)
+project(ddo_native_cpu_contracts LANGUAGES CXX)
+
+# Deliberately independent of the shared-library project and CUDA toolkit.
+find_package(Threads REQUIRED)
+enable_testing()
+
+foreach(contract IN ITEMS allocation_footprint cache_selection read_wait
+        source_flights source_scheduler span_ledger stream_dependency)
+    add_executable(ddo_${contract}_cpu ../${contract}_test.cpp)
+    target_compile_features(ddo_${contract}_cpu PRIVATE cxx_std_20)
+    target_include_directories(ddo_${contract}_cpu PRIVATE ../../include)
+    target_link_libraries(ddo_${contract}_cpu PRIVATE Threads::Threads)
+    if(MSVC)
+        target_compile_options(ddo_${contract}_cpu PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(ddo_${contract}_cpu PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME ${contract}_cpu COMMAND ddo_${contract}_cpu)
+    set_tests_properties(${contract}_cpu PROPERTIES TIMEOUT 30 LABELS cpu)
+endforeach()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_subdirectory(../posix-source posix-source)
+    set_tests_properties(posix_source_cpu PROPERTIES TIMEOUT 30 LABELS cpu)
+endif()

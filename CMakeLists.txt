@@ -8,6 +8,7 @@ option(DDO_VMM_NATIVE_SOURCE_DISPATCHER "Build the unpromoted asynchronous sourc
 option(DDO_VMM_SOURCE_TEST_HOOKS "Enable isolated source lifecycle fault injection (never production)" OFF)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(ddo_vmm SHARED
     native/src/ddo_vmm.cpp
@@ -23,7 +24,7 @@ target_include_directories(ddo_vmm
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/native/include>
 )
-target_link_libraries(ddo_vmm PRIVATE CUDA::cuda_driver)
+target_link_libraries(ddo_vmm PRIVATE CUDA::cuda_driver Threads::Threads)
 if(DDO_VMM_SOURCE_TEST_HOOKS)
     target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_SOURCE_TEST_HOOKS=1)
 endif()

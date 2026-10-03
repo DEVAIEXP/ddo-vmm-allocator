@@ -61,6 +61,12 @@ results rather than treating historical test counts as the current baseline.
 
 ## Integration
 
+To resume on Linux, read `../docs/linux-handoff.md` and DDO's Linux plan.
+`scripts/build_linux.py --mode cpu` builds isolated contracts without CUDA;
+`--mode library` only builds the experimental library. Neither authorizes CUDA
+tests. Use DDO's `.venv-linux` and `build-linux`, preserving Windows environments
+and binaries. A POSIX source does not imply portable cache/DMA support.
+
 Hosts use DDO's public API, which consumes `attach_model_linear_modules`.
 During source gates, preserve the active 4 GiB budget and approved staging;
 the host cache has a separate ceiling and does not increase the GPU budget.
