@@ -1,4 +1,4 @@
-"""Portable foundations for a DDO CUDA VMM allocator."""
+"""Portable foundations for the DDO CUDA VMM allocator."""
 
 from .platform import CudaVmmCapabilities, detect_cuda_vmm_capabilities
 from .tensor_owners import TensorOwnerGroup, capture_model_tensor_owners
