@@ -1,6 +1,7 @@
 """Small hardware gates for retained native source bytes; no model harness."""
 import os
 import ctypes
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -327,10 +328,13 @@ def test_speculative_cache_hit_and_ring_bypass_feed_one_dma_dependency(runtime, 
 @pytest.fixture
 def runtime():
     import torch
-    if os.name != "nt" or not torch.cuda.is_available():
-        pytest.skip("Windows CUDA required")
+    if os.name != "nt" and sys.platform != "linux":
+        pytest.skip("native Windows or Linux CUDA required")
+    if not torch.cuda.is_available():
+        pytest.fail("CUDA gate requested but no CUDA device is available")
     torch.empty(1, device="cuda:0")  # Establish primary context explicitly.
-    path = Path(os.environ.get("DDO_VMM_LIBRARY_PATH", Path(__file__).parents[1] / "build/Release/ddo_vmm.dll"))
+    relative = "build-linux/libddo_vmm.so" if sys.platform == "linux" else "build/Release/ddo_vmm.dll"
+    path = Path(os.environ.get("DDO_VMM_LIBRARY_PATH", Path(__file__).parents[1] / relative))
     return torch, load_native_vmm(path)
 
 

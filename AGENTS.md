@@ -67,6 +67,15 @@ To resume on Linux, read `../docs/linux-handoff.md` and DDO's Linux plan.
 tests. Use DDO's `.venv-linux` and `build-linux`, preserving Windows environments
 and binaries. A POSIX source does not imply portable cache/DMA support.
 
+Current Linux checkpoint: `../docs/native-linux-transport-gate.md`. Transport,
+mmap storage/cache/batches compiled; CPU tests and the probe/seven approved CUDA
+contracts passed. The corrected library also passed three CUDA cache contracts
+and one real staged generation with native encoder/transformer; see
+`../docs/native-linux-staged-gate.md`. New CUDA tests and model executions still
+require separate confirmation. Preserve commit/cgroup v2/process limits, with
+no automatic growth or WDDM emulation. Unregistration must preserve bytes;
+ownership/events remain native.
+
 Hosts use DDO's public API, which consumes `attach_model_linear_modules`.
 During source gates, preserve the active 4 GiB budget and approved staging;
 the host cache has a separate ceiling and does not increase the GPU budget.

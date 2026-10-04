@@ -2,6 +2,7 @@
 #include "ddo_vmm_timeline.h"
 #include "source_io.h"
 #include "host_accounting.h"
+#include "host_platform.h"
 #include "ddo_vmm_read_wait.h"
 
 #include <cuda.h>
@@ -282,7 +283,7 @@ struct ddo_vmm_host_ring {
     std::vector<Slot> slots;
     std::condition_variable read_waiters_retired;
     bool closing = false;
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     struct FileReadCompletion {
         std::promise<FileReadResult> promise;
         std::atomic<size_t> pending_chunks = 0;
@@ -291,7 +292,7 @@ struct ddo_vmm_host_ring {
         std::string error;
     };
     struct FileReadTask {
-        HANDLE file = INVALID_HANDLE_VALUE;
+        ddo_source_io::file_handle file = ddo_source_io::invalid_file_handle;
         uint64_t offset = 0;
         void* destination = nullptr;
         size_t size = 0;
@@ -303,21 +304,21 @@ struct ddo_vmm_host_ring {
     std::deque<FileReadTask> source_queue;
     std::vector<std::thread> source_workers;
     bool source_stopping = false;
-    std::unordered_map<std::string, HANDLE> shard_files;
+    std::unordered_map<std::string, ddo_source_io::file_handle> shard_files;
     std::atomic<uint64_t> source_read_chunks = 0;
     std::atomic<uint64_t> source_read_bytes = 0;
     std::atomic<uint64_t> source_read_failures = 0;
 #endif
 };
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 constexpr size_t kNativeSourceChunkBytes = 2 * 1024 * 1024;
 constexpr size_t kNativeSourceWorkerLimit = 8;
 constexpr size_t kNativeSourceQueueLimit = 256;
 
 ddo_vmm_status enqueue_source_read_locked(
     ddo_vmm_host_ring* ring, ddo_vmm_host_ring::Slot& slot,
-    HANDLE file, uint64_t file_offset_bytes, size_t size_bytes
+    ddo_source_io::file_handle file, uint64_t file_offset_bytes, size_t size_bytes
 );
 
 void complete_host_ring_source_read(
@@ -372,13 +373,14 @@ void host_ring_source_worker(ddo_vmm_host_ring* ring) {
             ring->source_queue.pop_front();
         }
         ring->source_space.notify_one();
-        const bool succeeded = read_file_handle_into_buffer(task.file, task.offset, task.destination, task.size);
+        std::string error;
+        const bool succeeded = ddo_source_io::read_file(task.file, task.offset, task.destination, task.size, error);
         ring->source_read_chunks.fetch_add(1, std::memory_order_relaxed);
         ring->source_read_bytes.fetch_add(task.size, std::memory_order_relaxed);
         if (!succeeded) {
             ring->source_read_failures.fetch_add(1, std::memory_order_relaxed);
         }
-        complete_host_ring_source_read(task.completion, succeeded, succeeded ? std::string{} : last_error);
+        complete_host_ring_source_read(task.completion, succeeded, error);
     }
 }
 
@@ -593,6 +595,9 @@ bool dxgi_budget_guard_allows_materialize(
     return local_safe && shared_safe && system_safe;
 #else
     (void)device_ordinal;
+    (void)required_bytes;
+    (void)backing_kind;
+    (void)allow_wddm_fallback;
     return true;
 #endif
 }
@@ -1804,7 +1809,7 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_read_file_to_arena_async(
     size_t size_bytes,
     void* cuda_stream
 ) {
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__linux__)
     (void)ring; (void)slot_index; (void)path_utf8; (void)file_offset_bytes;
     (void)arena; (void)arena_offset_bytes; (void)size_bytes; (void)cuda_stream;
     last_error = "native shard file transport is currently Windows-only";
@@ -1840,7 +1845,7 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_read_file_async(
     ddo_vmm_host_ring* ring, size_t slot_index, const char* path_utf8,
     uint64_t file_offset_bytes, size_t size_bytes
 ) {
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__linux__)
     (void)ring; (void)slot_index; (void)path_utf8; (void)file_offset_bytes; (void)size_bytes;
     last_error = "native shard file transport is currently Windows-only";
     return DDO_VMM_INVALID_ARGUMENT;
@@ -1856,13 +1861,13 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_read_file_async(
         return DDO_VMM_OUT_OF_MEMORY;
     }
     const std::string path(path_utf8);
-    HANDLE file = INVALID_HANDLE_VALUE;
+    auto file = ddo_source_io::invalid_file_handle;
     const auto existing = ring->shard_files.find(path);
     if (existing != ring->shard_files.end()) {
         file = existing->second;
     } else {
-        file = open_native_shard_file(path_utf8);
-        if (file == INVALID_HANDLE_VALUE) {
+        file = ddo_source_io::open_file(path_utf8, last_error);
+        if (file == ddo_source_io::invalid_file_handle) {
             return DDO_VMM_CUDA_ERROR;
         }
         ring->shard_files.emplace(path, file);
@@ -1871,7 +1876,7 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_read_file_async(
 #endif
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 ddo_vmm_status ddo_source_io::read_source_async(
     ddo_vmm_host_ring* ring, size_t slot_index, const ddo_vmm_source_file* source,
     uint64_t offset, size_t size
@@ -1916,10 +1921,10 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_wait_file_read(ddo_vmm_host_ring* ri
 }
 
 /* Source queue implementation is shared by the ring and persistent cache. */
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 ddo_vmm_status enqueue_source_read_locked(
     ddo_vmm_host_ring* ring, ddo_vmm_host_ring::Slot& slot,
-    HANDLE file, uint64_t file_offset_bytes, size_t size_bytes
+    ddo_source_io::file_handle file, uint64_t file_offset_bytes, size_t size_bytes
 ) {
     const size_t chunk_count = (size_bytes + kNativeSourceChunkBytes - 1) / kNativeSourceChunkBytes;
     auto completion = std::make_shared<ddo_vmm_host_ring::FileReadCompletion>();
@@ -2170,19 +2175,25 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_create(
             last_error = "host ring would exceed the active source-cache process limit";
             return DDO_VMM_OUT_OF_MEMORY;
         }
-#if defined(_WIN32)
-        MEMORYSTATUSEX memory{};
-        memory.dwLength = sizeof(memory);
+        ddo_host_platform::Headroom memory{};
         const uint64_t headroom = ddo_host_accounting::active_cache_headroom_bytes;
-        if (!GlobalMemoryStatusEx(&memory) || requested_bytes > memory.ullAvailPhys
-            || requested_bytes > memory.ullAvailPageFile
-            || headroom > memory.ullAvailPhys - requested_bytes
-            || headroom > memory.ullAvailPageFile - requested_bytes) {
+        if (!ddo_host_platform::headroom(memory)
+            || !ddo_host_platform::permits(memory, requested_bytes, headroom)) {
             last_error = "host ring registration would breach source-cache RAM/commit headroom";
             return DDO_VMM_OUT_OF_MEMORY;
         }
-#endif
     }
+#if defined(__linux__)
+    else {
+        // Ring-only transport must not bypass Linux process/container limits.
+        ddo_host_platform::Headroom memory{};
+        if (!ddo_host_platform::headroom(memory)
+            || !ddo_host_platform::permits(memory, requested_bytes, 0)) {
+            last_error = "host ring Linux host/cgroup headroom unavailable or insufficient";
+            return DDO_VMM_OUT_OF_MEMORY;
+        }
+    }
+#endif
     CUcontext retained_primary_context = nullptr;
     if (!ensure_context(device_ordinal, &retained_primary_context)) {
         return DDO_VMM_CUDA_ERROR;
@@ -2193,8 +2204,8 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_create(
     ring->slots.reserve(slot_count);
     for (size_t index = 0; index < slot_count; ++index) {
         ddo_vmm_host_ring::Slot slot{};
-#if defined(_WIN32)
-        slot.address = VirtualAlloc(nullptr, slot_size_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#if defined(_WIN32) || defined(__linux__)
+        slot.address = ddo_host_platform::allocate(slot_size_bytes);
         if (slot.address != nullptr
             && checked(cuMemHostRegister(slot.address, slot_size_bytes, CU_MEMHOSTREGISTER_PORTABLE), "cuMemHostRegister")) {
             slot.virtual_memory_registered = true;
@@ -2208,20 +2219,20 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_create(
                 cuEventDestroy(slot.completion);
             }
             if (slot.address != nullptr) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
                 if (slot.virtual_memory_registered) {
                     cuMemHostUnregister(slot.address);
                 }
-                VirtualFree(slot.address, 0, MEM_RELEASE);
+                ddo_host_platform::release(slot.address, slot_size_bytes);
 #else
                 cuMemFreeHost(slot.address);
 #endif
             }
             for (const auto& allocated : ring->slots) {
                 cuEventDestroy(allocated.completion);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
                 cuMemHostUnregister(allocated.address);
-                VirtualFree(allocated.address, 0, MEM_RELEASE);
+                ddo_host_platform::release(allocated.address, slot_size_bytes);
 #else
                 cuMemFreeHost(allocated.address);
 #endif
@@ -2231,12 +2242,12 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_create(
         }
         ring->slots.push_back(std::move(slot));
     }
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     if (!start_host_ring_source_workers(ring.get())) {
         for (const auto& allocated : ring->slots) {
             cuEventDestroy(allocated.completion);
             cuMemHostUnregister(allocated.address);
-            VirtualFree(allocated.address, 0, MEM_RELEASE);
+            ddo_host_platform::release(allocated.address, slot_size_bytes);
         }
         release_temporary_primary_context(device_ordinal, retained_primary_context);
         return DDO_VMM_CUDA_ERROR;
@@ -2268,22 +2279,22 @@ extern "C" void ddo_vmm_host_ring_destroy(ddo_vmm_host_ring* ring) {
             cuEventSynchronize(slot.completion);
         }
         if (slot.completion) cuEventDestroy(slot.completion);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
         if (slot.virtual_memory_registered) {
             if (cuMemHostUnregister(slot.address) == CUDA_SUCCESS && ring->accounted_staging)
                 released_staging += ring->slot_size;
         }
-        if (slot.address) VirtualFree(slot.address, 0, MEM_RELEASE);
+        if (slot.address) ddo_host_platform::release(slot.address, ring->slot_size);
 #else
         if (slot.address && cuMemFreeHost(slot.address) == CUDA_SUCCESS && ring->accounted_staging)
             released_staging += ring->slot_size;
 #endif
     }
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     stop_host_ring_source_workers(ring);
     for (const auto& [path, file] : ring->shard_files) {
         (void)path;
-        CloseHandle(file);
+        ddo_source_io::close_file(file);
     }
     ring->shard_files.clear();
 #endif
@@ -2295,7 +2306,7 @@ extern "C" void ddo_vmm_host_ring_destroy(ddo_vmm_host_ring* ring) {
     delete ring;
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 ddo_vmm_status ddo_source_io::create_lazy_ring(
     int device, size_t slot_bytes, size_t slots, ddo_vmm_host_ring** output
 ) {
@@ -2330,7 +2341,7 @@ ddo_vmm_status ddo_source_io::commit_storage(ddo_vmm_host_ring* ring, size_t ind
     CUevent event = nullptr;
     if (!checked(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING), "cuEventCreate(cache slot)"))
         return DDO_VMM_CUDA_ERROR;
-    void* address = VirtualAlloc(nullptr, ring->slot_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* address = ddo_host_platform::allocate(ring->slot_size);
     if (!address) {
         cuEventDestroy(event);
         last_error = "progressive host slot commit failed";
@@ -2406,7 +2417,7 @@ ddo_vmm_status ddo_source_io::release_slot(ddo_vmm_host_ring* ring, size_t index
         slot.virtual_memory_registered = false;
     }
     if (slot.address) {
-        if (!VirtualFree(slot.address, 0, MEM_RELEASE)) {
+        if (!ddo_host_platform::release(slot.address, ring->slot_size)) {
             last_error = "progressive host slot release failed";
             return DDO_VMM_INTERNAL_ERROR;
         }
@@ -2425,7 +2436,7 @@ extern "C" size_t ddo_vmm_host_ring_slot_count(const ddo_vmm_host_ring* ring) {
 }
 
 extern "C" size_t ddo_vmm_host_ring_source_worker_count(const ddo_vmm_host_ring* ring) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     return ring == nullptr ? 0 : ring->source_workers.size();
 #else
     (void)ring;
@@ -2434,7 +2445,7 @@ extern "C" size_t ddo_vmm_host_ring_source_worker_count(const ddo_vmm_host_ring*
 }
 
 extern "C" uint64_t ddo_vmm_host_ring_source_read_chunks(const ddo_vmm_host_ring* ring) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     return ring == nullptr ? 0 : ring->source_read_chunks.load(std::memory_order_relaxed);
 #else
     (void)ring;
@@ -2443,7 +2454,7 @@ extern "C" uint64_t ddo_vmm_host_ring_source_read_chunks(const ddo_vmm_host_ring
 }
 
 extern "C" uint64_t ddo_vmm_host_ring_source_read_bytes(const ddo_vmm_host_ring* ring) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     return ring == nullptr ? 0 : ring->source_read_bytes.load(std::memory_order_relaxed);
 #else
     (void)ring;
@@ -2452,7 +2463,7 @@ extern "C" uint64_t ddo_vmm_host_ring_source_read_bytes(const ddo_vmm_host_ring*
 }
 
 extern "C" uint64_t ddo_vmm_host_ring_source_read_failures(const ddo_vmm_host_ring* ring) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     return ring == nullptr ? 0 : ring->source_read_failures.load(std::memory_order_relaxed);
 #else
     (void)ring;

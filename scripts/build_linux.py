@@ -24,10 +24,10 @@ def build_commands(root: Path, mode: str, jobs: int) -> list[list[str]]:
     configure = ["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release"]
     if mode == "library":
         configure += [
-            "-DDO_VMM_BUILD_PROBES=OFF",
-            "-DDO_VMM_NATIVE_SPAN_POOL=ON",
-            "-DDO_VMM_NATIVE_SOURCE_DISPATCHER=OFF",
-            "-DDO_VMM_SOURCE_TEST_HOOKS=OFF",
+            "-DDDO_VMM_BUILD_PROBES=OFF",
+            "-DDDO_VMM_NATIVE_SPAN_POOL=ON",
+            "-DDDO_VMM_NATIVE_SOURCE_DISPATCHER=OFF",
+            "-DDDO_VMM_SOURCE_TEST_HOOKS=OFF",
         ]
     commands = [configure, ["cmake", "--build", str(build), "--parallel", str(jobs)]]
     if mode == "cpu":

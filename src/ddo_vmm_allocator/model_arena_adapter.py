@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
@@ -416,15 +417,15 @@ class _NativeCacheReadTicket:
 
 
 class _NativeShardTransport:
-    """Bounded Windows shard source backed by native registered host slots."""
+    """Bounded native shard source backed by registered host slots."""
 
     _WINDOW_BYTES = 64 * 2**20
 
     def __init__(self, library: NativeVmmLibrary, *, slot_size_bytes: int, slots: int, device_ordinal: int,
                  cache_slot_bytes: int = 0, cache_slots: int = 0, cache_process_limit_bytes: int = 0,
                  cache_model_windows: bool = False, cache_registered_limit_bytes: int = 0) -> None:
-        if os.name != "nt":
-            raise ModelArenaError("native shard transport is currently Windows-only")
+        if sys.platform not in {"win32", "linux"}:
+            raise ModelArenaError("native shard transport requires Windows or native Linux")
         # Preserve the configured total capacity, but give each internal
         # transfer window its own CUDA event.  A completed 64 MiB window can
         # feed DMA while later windows are still being read from a shard.

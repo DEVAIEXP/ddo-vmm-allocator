@@ -4,6 +4,7 @@
 #include "ddo_vmm_source_flights.h"
 #include "source_io.h"
 #include "host_accounting.h"
+#include "host_platform.h"
 #include <cuda.h>
 #include <cstdio>
 #include <cstring>
@@ -204,7 +205,7 @@ bool same_file(const ddo_vmm_source_file_info& a, const ddo_vmm_source_file_info
 // no CUDA calls/context, no tensor owners and no new host or registration cap.
 // The cache owns ring storage until stop_reads() joins this dispatcher.
 void dispatch_reads(ddo_vmm_source_cache* cache) noexcept {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     using Work = ddo_vmm_detail::SourceReadScheduler::Work;
     using Flights = ddo_vmm_detail::SourceReadFlights<Work, ddo_vmm_status>;
     // Same existing worker/slot geometry, not a new host/GPU memory ceiling.
@@ -291,7 +292,7 @@ void dispatch_reads(ddo_vmm_source_cache* cache) noexcept {
 }
 
 // Caller owns cache->mutex, and storage has already passed existing admission.
-ddo_vmm_status schedule_read(ddo_vmm_source_cache* cache,
+[[maybe_unused]] ddo_vmm_status schedule_read(ddo_vmm_source_cache* cache,
     const std::shared_ptr<Entry>& entry, bool demand) {
     using namespace ddo_vmm_detail;
     {
@@ -329,19 +330,16 @@ void stop_reads(ddo_vmm_source_cache* cache) {
 }
 
 ddo_vmm_status admit_slot(ddo_vmm_source_cache* cache, Entry& entry) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     // Lock order: cache -> aggregate -> ring. Workers never take the first two.
     std::lock_guard<std::mutex> lock(aggregate_mutex);
     const uint64_t limit = effective_process_limit();
     const uint64_t staging = ddo_host_accounting::staging_registered_bytes;
-    MEMORYSTATUSEX memory{};
-    memory.dwLength = sizeof(memory);
+    ddo_host_platform::Headroom memory{};
     if (staging > limit || aggregate_committed_bytes > limit - staging
         || cache->slot_size > limit - staging - aggregate_committed_bytes
-        || !GlobalMemoryStatusEx(&memory) || cache->slot_size > memory.ullAvailPhys
-        || cache->slot_size > memory.ullAvailPageFile
-        || cache->host_headroom > memory.ullAvailPhys - cache->slot_size
-        || cache->host_headroom > memory.ullAvailPageFile - cache->slot_size) {
+        || !ddo_host_platform::headroom(memory)
+        || !ddo_host_platform::permits(memory, cache->slot_size, cache->host_headroom)) {
         ++cache->stats.admission_denials;
         return DDO_VMM_BYPASS;
     }
@@ -378,7 +376,7 @@ uint64_t saturating_add(uint64_t left, uint64_t right) {
 // Caller holds cache->mutex. Releasing only the tail preserves the dense slot
 // index and avoids moving registered bytes while another entry is in use.
 ddo_vmm_status unregister_entry(ddo_vmm_source_cache* cache, Entry& entry) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     if (!entry.registered) return DDO_VMM_SUCCESS;
     if (!entry.ready || entry.active_dmas) return DDO_VMM_BUSY;
     std::lock_guard<std::mutex> aggregate_lock(aggregate_mutex);
@@ -399,7 +397,7 @@ ddo_vmm_status unregister_entry(ddo_vmm_source_cache* cache, Entry& entry) {
 }
 
 ddo_vmm_status trim_ready_tail(ddo_vmm_source_cache* cache, uint64_t target, bool discard_storage = false) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     if (cache->persistent_buffer && !discard_storage) {
         for (auto entry = cache->entries.rbegin(); entry != cache->entries.rend() && cache->stats.registered_bytes > target; ++entry) {
             if (!(*entry)->registered || !(*entry)->ready || (*entry)->active_dmas) continue;
@@ -438,14 +436,13 @@ ddo_vmm_status trim_ready_tail(ddo_vmm_source_cache* cache, uint64_t target, boo
 // Existing hits remain usable while growth is suspended. Workers and DMAs do
 // not need the cache or process accounting lock to finish.
 ddo_vmm_status poll_pressure(ddo_vmm_source_cache* cache) {
-#if defined(_WIN32)
-    MEMORYSTATUSEX memory{};
-    memory.dwLength = sizeof(memory);
-    if (!GlobalMemoryStatusEx(&memory)) {
+#if defined(_WIN32) || defined(__linux__)
+    ddo_host_platform::Headroom memory{};
+    if (!ddo_host_platform::headroom(memory)) {
         cache->pressure_suspended = true;
         return DDO_VMM_SUCCESS;
     }
-    uint64_t available = std::min(memory.ullAvailPhys, memory.ullAvailPageFile);
+    uint64_t available = std::min(memory.ram, memory.commit);
     const uint64_t low = saturating_add(cache->host_headroom, cache->slot_size);
     const uint64_t high = saturating_add(low, cache->slot_size);
     if (available < low) cache->pressure_suspended = true;
@@ -455,8 +452,8 @@ ddo_vmm_status poll_pressure(ddo_vmm_source_cache* cache) {
         auto status = trim_ready_tail(cache, target, true);
         if (status == DDO_VMM_BUSY) break;
         if (status != DDO_VMM_SUCCESS) return status;
-        if (!GlobalMemoryStatusEx(&memory)) break;
-        available = std::min(memory.ullAvailPhys, memory.ullAvailPageFile);
+        if (!ddo_host_platform::headroom(memory)) break;
+        available = std::min(memory.ram, memory.commit);
     }
     if (available >= high) cache->pressure_suspended = false;
     return DDO_VMM_SUCCESS;
@@ -484,7 +481,7 @@ ddo_vmm_status retire_transfer(ddo_vmm_source_ticket* ticket, bool wait) {
 }
 
 ddo_vmm_status ensure_registration(ddo_vmm_source_cache* cache, Entry& entry) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     if (entry.registered) return DDO_VMM_SUCCESS;
     for (auto* ticket : cache->transfers) {
         auto status = retire_transfer(ticket, false);
@@ -555,7 +552,7 @@ extern "C" ddo_vmm_status ddo_vmm_source_cache_create(
             : config->version == 3 ? extended_process_limit_bytes : micro_limit_bytes;
         if (!process_limit || process_limit > maximum_process_limit)
             return failure(DDO_VMM_INVALID_ARGUMENT, "process cache limit exceeds its config version ceiling");
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__linux__)
         return failure(DDO_VMM_UNSUPPORTED, "source cache is currently Windows-only");
 #else
         const uint64_t capacity = config->slot_count * config->slot_bytes;
@@ -563,12 +560,11 @@ extern "C" ddo_vmm_status ddo_vmm_source_cache_create(
             ? config->registered_limit_bytes : capacity;
         if (registered_limit < config->slot_bytes || registered_limit > capacity || registered_limit % config->slot_bytes)
             return failure(DDO_VMM_INVALID_ARGUMENT, "registration ceiling must cover whole segments within storage capacity");
-        MEMORYSTATUSEX memory{};
-        memory.dwLength = sizeof(memory);
-        if (!GlobalMemoryStatusEx(&memory) || config->slot_bytes > memory.ullAvailPhys || config->slot_bytes > memory.ullAvailPageFile
-            || config->host_headroom_bytes > memory.ullAvailPhys - config->slot_bytes
-            || config->host_headroom_bytes > memory.ullAvailPageFile - config->slot_bytes)
-            return failure(DDO_VMM_BYPASS, "source cache host headroom denied");
+        ddo_host_platform::Headroom memory{};
+        if (!ddo_host_platform::headroom(memory))
+            return failure(DDO_VMM_BYPASS, "source cache host/cgroup headroom observation unavailable");
+        if (!ddo_host_platform::permits(memory, config->slot_bytes, config->host_headroom_bytes))
+            return failure(DDO_VMM_BYPASS, "source cache host/cgroup RAM/commit headroom denied");
         auto cache = std::make_unique<ddo_vmm_source_cache>();
         cache->device = config->device_ordinal;
         cache->slot_size = static_cast<size_t>(config->slot_bytes);
@@ -679,7 +675,7 @@ static ddo_vmm_status cache_request_impl(
             // cannot close the source while a worker still holds its HANDLE.
             cache->entries.push_back(found);
             cache->stats.retained_bytes += fill_size;
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 #if defined(DDO_VMM_NATIVE_SOURCE_DISPATCHER)
             if (cache->persistent_buffer) status = schedule_read(cache, found, demand);
             else
@@ -717,7 +713,7 @@ extern "C" ddo_vmm_status ddo_vmm_source_cache_request(
 }
 
 extern "C" int ddo_vmm_source_dispatcher_enabled(void) {
-#if defined(DDO_VMM_NATIVE_SOURCE_DISPATCHER) && defined(_WIN32)
+#if defined(DDO_VMM_NATIVE_SOURCE_DISPATCHER) && (defined(_WIN32) || defined(__linux__))
     return 1;
 #else
     return 0;
@@ -878,7 +874,7 @@ extern "C" ddo_vmm_status ddo_vmm_source_ticket_copy_via_ring_async(
         if (status != DDO_VMM_SUCCESS) return status;
         status = wait_entry(ticket->cache, *ticket->entry);
         if (status != DDO_VMM_SUCCESS) return status;
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
         auto address = ddo_vmm_host_ring_slot_address(ticket->cache->ring, ticket->entry->slot);
         const auto slot_size = ddo_vmm_host_ring_slot_size(ring);
         if (!slot_size) return failure(DDO_VMM_INVALID_ARGUMENT, "fallback ring has no storage");
@@ -992,7 +988,7 @@ extern "C" ddo_vmm_status ddo_vmm_source_cache_clear(ddo_vmm_source_cache* cache
         // source handles remain alive until every pending read has drained.
         for (auto& entry : cache->entries) {
             ddo_vmm_host_ring_wait_file_read(cache->ring, entry->slot);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
             if (entry->committed) {
                 std::lock_guard<std::mutex> aggregate_lock(aggregate_mutex);
                 status = ddo_source_io::release_slot(cache->ring, entry->slot);
@@ -1255,7 +1251,7 @@ extern "C" ddo_vmm_status ddo_vmm_source_batch_submit(ddo_vmm_source_batch* batc
                     }
                     if (status != DDO_VMM_SUCCESS) return status;
                 } else {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
                     size_t copied = 0;
                     while (copied < item.size) {
                         const size_t bytes = std::min(batch->ring_slot_bytes, item.size - copied);

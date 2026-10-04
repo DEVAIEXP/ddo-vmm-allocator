@@ -14,3 +14,4 @@ target_include_directories(ddo_posix_source_contract PRIVATE ../../include ../..
 target_link_libraries(ddo_posix_source_contract PRIVATE Threads::Threads)
 enable_testing()
 add_test(NAME posix_source_cpu COMMAND ddo_posix_source_contract)
+set_tests_properties(posix_source_cpu PROPERTIES TIMEOUT 30 LABELS cpu)

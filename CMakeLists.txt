@@ -7,6 +7,14 @@ option(DDO_VMM_NATIVE_SPAN_POOL "Build the unpromoted native span-pool candidate
 option(DDO_VMM_NATIVE_SOURCE_DISPATCHER "Build the unpromoted asynchronous source dispatcher" OFF)
 option(DDO_VMM_SOURCE_TEST_HOOKS "Enable isolated source lifecycle fault injection (never production)" OFF)
 
+# NVIDIA's Linux Python toolkit has a versioned runtime library but may lack
+# the unversioned development symlink FindCUDAToolkit expects. This target uses
+# only the Driver API; provide the real runtime path for toolkit discovery,
+# without linking cudart or fabricating a symlink in the environment.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_library(CUDA_CUDART NAMES cudart libcudart.so.13 libcudart.so.12
+        HINTS "${CUDAToolkit_ROOT}/lib" "$ENV{CUDAToolkit_ROOT}/lib")
+endif()
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 

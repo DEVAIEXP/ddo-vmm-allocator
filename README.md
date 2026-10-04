@@ -38,6 +38,16 @@ The VMM lifecycle is designed for CUDA on Windows and Linux.  Both platforms sup
 
 ## Development status
 
+Current native Linux checkpoint: source/ring/persistent-storage/cache/batches
+compile into `build-linux/libddo_vmm.so` with CPU contracts passed; the approved
+allocator probe and seven small CUDA contracts also passed. The corrected library
+then passed three cache contracts and one selected native encoder/transformer
+staged generation (1.050970s/step); [manifest/limits](../docs/native-linux-staged-gate.md).
+Linux remains experimental outside that bounded workload. Use the parent DDO
+`.venv-linux` / optional `vmm-dev-linux` profile and its
+[build/evidence guide](../docs/native-linux-transport-gate.md). Preserve Windows
+builds. The older core-probe description below is historical, not current scope.
+
 The portable C++ library now contains a first CUDA Driver VMM probe: it creates a device-local physical allocation, maps it into a reserved virtual address, grants access, writes through the mapping, and tears it down.  It still does not install a PyTorch allocator.  That separation is deliberate: a Python-only package cannot safely replace PyTorch's native caching allocator.
 
 ## Windows build and probe
