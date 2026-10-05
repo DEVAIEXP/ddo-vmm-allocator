@@ -1,5 +1,11 @@
 # Allocator guidance
 
+## Documentation Language
+
+- Write all new or updated repository documentation in English, including README files, AGENTS.md, documentation pages, handoffs, plans, benchmark commentary, and explanatory examples or docstrings.
+- Preserve verbatim quotations, raw logs, benchmark prompts, and required license or attribution text in their original form; write surrounding explanations in English. Do not change recorded evidence merely to translate it.
+- This requirement applies to repository documentation, not to conversations with the user, which may remain in the user's preferred language.
+
 ## Scope
 
 This subproject provides the native CUDA Driver VMM library and the PyTorch
