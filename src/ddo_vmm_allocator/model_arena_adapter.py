@@ -144,7 +144,21 @@ def inspect_model_linear_layout(root, module_pattern: str = ".*") -> dict[str, A
     }
 
 
-def _layout_view_spans(selected, unit_by_module):
+def _layout_parameter_items(module, auxiliary_groups=None):
+    """Legacy Linear geometry, extended only by explicit auxiliary ownership."""
+    import torch
+
+    keys = ("weight", "bias") if isinstance(module, torch.nn.Linear) else tuple(module._parameters)
+    for key in keys:
+        parameter = module._parameters.get(key)
+        if not isinstance(parameter, torch.nn.Parameter):
+            continue
+        if not isinstance(module, torch.nn.Linear) and (id(module), key) not in (auxiliary_groups or {}):
+            continue
+        yield key, parameter
+
+
+def _layout_view_spans(selected, unit_by_module, auxiliary_groups=None):
     """Aligned contiguous setup spans, without keeping CPU source tensors."""
     import torch
 
@@ -153,10 +167,7 @@ def _layout_view_spans(selected, unit_by_module):
     previous_unit = None
     for name, module in selected:
         unit = unit_by_module[name][0] if name in unit_by_module else name
-        for parameter_name in ("weight", "bias"):
-            parameter = getattr(module, parameter_name, None)
-            if not isinstance(parameter, torch.nn.Parameter):
-                continue
+        for parameter_name, parameter in _layout_parameter_items(module, auxiliary_groups):
             offset = _align_up(offset, max(parameter.element_size(), 256))
             size = parameter.numel() * parameter.element_size()
             if size <= 0:
@@ -2094,7 +2105,7 @@ class ModelArenaModuleAdapter:
         # Some focused contracts use a minimal store double. Production stores
         # always expose the scoped setup operation; no runner policy is added.
         setup = getattr(self.store, "view_setup", None)
-        scope = setup(_layout_view_spans(layout[0], layout[1])) if setup is not None else nullcontext()
+        scope = setup(_layout_view_spans(layout[0], layout[1], layout[3] if len(layout) > 3 else None)) if setup is not None else nullcontext()
         with scope:
             report = self._attach_linear_modules(root, module_pattern, _layout=layout)
         # Temporary view mappings must be released before source startup or
@@ -2114,7 +2125,9 @@ class ModelArenaModuleAdapter:
 
         if not isinstance(root, torch.nn.Module):
             raise TypeError("root must be a torch.nn.Module")
-        selected, unit_by_module, _payload = _layout or _discover_linear_layout(root, module_pattern)
+        layout = _layout or _discover_linear_layout(root, module_pattern)
+        selected, unit_by_module, _payload = layout[:3]
+        auxiliary_groups = layout[3] if len(layout) > 3 else {}
         virtual_bytes = self.store.virtual_bytes
         unit_modules = {}
         offset = 0
@@ -2123,10 +2136,7 @@ class ModelArenaModuleAdapter:
 
         for module_name, module in selected:
             tensor_bindings: list[_TensorBinding] = []
-            for parameter_name in ("weight", "bias"):
-                parameter = getattr(module, parameter_name, None)
-                if not isinstance(parameter, torch.nn.Parameter):
-                    continue
+            for parameter_name, parameter in _layout_parameter_items(module, auxiliary_groups):
                 # Keep the loader-owned CPU storage intact.  The safetensor
                 # slice registry is keyed by that storage address; cloning
                 # here would silently disable direct shard reads.
@@ -2149,8 +2159,12 @@ class ModelArenaModuleAdapter:
                 if offset + nbytes > virtual_bytes:
                     raise ModelArenaError("model arena virtual span is smaller than attached payload")
                 stable, initial_signature = self.store.stable_tensor(offset=offset, source=source)
-                module.register_parameter(parameter_name, torch.nn.Parameter(stable, requires_grad=False))
-                if file_slice is not None and stable.device.type != "cpu":
+                group = auxiliary_groups.get((id(module), parameter_name))
+                if group is not None:
+                    self._publish_auxiliary_view(group, stable, file_slice)
+                else:
+                    module.register_parameter(parameter_name, torch.nn.Parameter(stable, requires_grad=False))
+                if file_slice is not None and (stable.device.type != "cpu" or group is not None):
                     retained_source: Any = _FileTensorDescriptor(
                         shape=tuple(source.shape),
                         dtype=source.dtype,
@@ -2295,12 +2309,16 @@ def attach_model_linear_modules(
     native_source_cache_model_windows: bool = False,
     native_source_cache_registered_limit_bytes: int = 0,
     component_tensor_ownership: bool = False,
+    execution_auxiliary_ownership: bool = False,
+    execution_auxiliary_small_tensor_threshold_bytes: int = 16 * 1024,
     component_buffer_limit_bytes: int = 1024**2,
 ) -> tuple[ModelArenaAttachReport, ModelArenaWeightStore]:
     """Create one model arena and attach matching dense linear weights."""
 
     import torch
 
+    if component_tensor_ownership and execution_auxiliary_ownership:
+        raise ValueError("component and execution auxiliary ownership are mutually exclusive")
     if component_tensor_ownership:
         if module_pattern != ".*":
             raise ValueError("component ownership requires full-component selection (module_pattern='.*')")
@@ -2320,7 +2338,16 @@ def attach_model_linear_modules(
             native_source_cache_registered_limit_bytes=native_source_cache_registered_limit_bytes,
         )
 
-    layout = _discover_linear_layout(root, module_pattern)
+    if execution_auxiliary_ownership:
+        if not native_transport_slot_size_bytes:
+            raise ValueError("execution auxiliary ownership requires native immutable file transport")
+        from .execution_auxiliary import discover_execution_auxiliary_layout
+
+        layout = discover_execution_auxiliary_layout(
+            root, module_pattern, file_slices,
+            small_tensor_threshold_bytes=execution_auxiliary_small_tensor_threshold_bytes)
+    else:
+        layout = _discover_linear_layout(root, module_pattern)
     payload_bytes = layout[2]
     if payload_bytes <= 0:
         raise ValueError(f"no dense linear parameters matched {module_pattern!r}")
@@ -2344,6 +2371,21 @@ def attach_model_linear_modules(
         native_source_cache_model_windows=native_source_cache_model_windows,
         native_source_cache_registered_limit_bytes=native_source_cache_registered_limit_bytes,
     )
-    adapter = ModelArenaModuleAdapter(store)
-    report = adapter.attach_linear_modules(root, module_pattern, _layout=layout)
+    if execution_auxiliary_ownership:
+        from .execution_auxiliary import ExecutionAuxiliaryAdapter
+
+        adapter = ExecutionAuxiliaryAdapter(store, tuple(layout[3].values()),
+                                           execution_auxiliary_small_tensor_threshold_bytes)
+        try:
+            report = adapter.attach_linear_modules(root, module_pattern, _layout=layout)
+        except BaseException as error:
+            def cleanup():
+                adapter.close()
+                store.close()
+            _run_cleanup_preserving_error(cleanup, "auxiliary attachment cleanup", error)
+            error.auxiliary_adapter = adapter
+            raise
+    else:
+        adapter = ModelArenaModuleAdapter(store)
+        report = adapter.attach_linear_modules(root, module_pattern, _layout=layout)
     return report, store

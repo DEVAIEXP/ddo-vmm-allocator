@@ -4,6 +4,7 @@
 #include "host_accounting.h"
 #include "host_platform.h"
 #include "ddo_vmm_read_wait.h"
+#include "ddo_vmm_allocation_diagnostics.h"
 
 #include <cuda.h>
 
@@ -30,6 +31,47 @@
 #include <windows.h>
 #include <dxgi1_4.h>
 #endif
+
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+namespace ddo_vmm_detail { AllocationDiagnostics allocation_diagnostics; }
+// Wrap only this native implementation's calls; disabled builds call the driver directly.
+#define cuMemCreate(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::create, [&] { return ::cuMemCreate(__VA_ARGS__); })
+#define cuMemMap(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::map, [&] { return ::cuMemMap(__VA_ARGS__); })
+#define cuMemSetAccess(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::access, [&] { const auto result = ::cuMemSetAccess(__VA_ARGS__); ddo_vmm_detail::allocation_diagnostics.access_result(result, CUDA_ERROR_NOT_READY, CUDA_ERROR_OUT_OF_MEMORY); return result; })
+#define cuMemUnmap(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::unmap, [&] { return ::cuMemUnmap(__VA_ARGS__); })
+#define cuMemRelease(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::release, [&] { return ::cuMemRelease(__VA_ARGS__); })
+#define cuMemAddressReserve(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::reserve, [&] { return ::cuMemAddressReserve(__VA_ARGS__); })
+#define cuMemAddressFree(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::address_free, [&] { return ::cuMemAddressFree(__VA_ARGS__); })
+#endif
+
+extern "C" int ddo_vmm_allocation_diagnostics_enable_v1(int enabled) {
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+    if (enabled != 0 && enabled != 1) return 1;
+    if (enabled) return ddo_vmm_detail::allocation_diagnostics.start() ? 0 : 1;
+    ddo_vmm_detail::allocation_diagnostics.enabled.store(false);
+    return 0;
+#else
+    (void)enabled;
+    return 2;
+#endif
+}
+extern "C" int ddo_vmm_allocation_diagnostics_snapshot_v1(uint64_t* values, size_t count) {
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+    return ddo_vmm_detail::allocation_diagnostics.snapshot(values, count);
+#else
+    (void)values; (void)count;
+    return 2;
+#endif
+}
+
+extern "C" int ddo_vmm_allocation_diagnostics_snapshot_v2(uint64_t* values, size_t count) {
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+    return ddo_vmm_detail::allocation_diagnostics.snapshot_v2(values, count);
+#else
+    (void)values; (void)count;
+    return 2;
+#endif
+}
 
 namespace {
 
@@ -1464,6 +1506,9 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
     size_t size_bytes,
     uint64_t* out_signature
 ) {
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+    ddo_vmm_detail::AllocationDiagnostics::FaultScope fault_diagnostic(ddo_vmm_detail::allocation_diagnostics);
+#endif
     std::unique_lock<std::mutex> mutation_lock;
     if (arena != nullptr) {
         mutation_lock = std::unique_lock<std::mutex>(arena->mutation_mutex);
@@ -1563,7 +1608,13 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
         for (int attempt = 0; attempt < 4 && access_result == CUDA_ERROR_NOT_READY; ++attempt) {
             access_result = cuMemSetAccess(page_address, arena->page_size, &access, 1);
             if (access_result == CUDA_ERROR_NOT_READY) {
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+                ddo_vmm_detail::allocation_diagnostics.measure(
+                    ddo_vmm_detail::AllocationDiagnostics::access_retry_sync,
+                    [&] { return cuCtxSynchronize(); });
+#else
                 cuCtxSynchronize();
+#endif
             }
         }
         if (!checked(access_result, "cuMemSetAccess")) {

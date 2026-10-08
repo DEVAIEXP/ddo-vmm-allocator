@@ -124,6 +124,50 @@ class NativeVmmLibrary:
             "cache_eviction_sync_seconds": values[5] / 1e9,
         }
 
+    def set_allocation_diagnostics(self, enabled: bool) -> None:
+        """Acquire/release a process-wide diagnostic scope; never initialize CUDA."""
+        fn = getattr(self._library, "ddo_vmm_allocation_diagnostics_enable_v1", None)
+        if fn is None:
+            raise NativeVmmError("allocation diagnostics require the separate diagnostic binary")
+        fn.argtypes, fn.restype = [ctypes.c_int], ctypes.c_int
+        status = int(fn(int(enabled)))
+        if status == 2:
+            raise NativeVmmError("allocation diagnostics are unsupported by this binary")
+        if status:
+            raise NativeVmmError("allocation diagnostic scope is already owned or invalid")
+
+    def allocation_diagnostics_snapshot(self) -> dict[str, int | float]:
+        """Optional cumulative native CPU timers; absent is unavailable, not zero."""
+        fn = getattr(self._library, "ddo_vmm_allocation_diagnostics_snapshot_v2", None)
+        version = 2 if fn is not None else 1
+        if fn is None:
+            fn = getattr(self._library, "ddo_vmm_allocation_diagnostics_snapshot_v1", None)
+        if fn is None:
+            return {}
+        fn.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        fn.restype = ctypes.c_int
+        values = (ctypes.c_uint64 * (36 if version == 2 else 26))()
+        status = int(fn(values, len(values)))
+        if status == 2:
+            return {}
+        if status or values[0] != version or values[1] not in (0, 1):
+            raise NativeVmmError("invalid allocation diagnostic snapshot/schema")
+        result = {"schema_version": version, "enabled": bool(values[1])}
+        for index, name in enumerate(("create", "map", "access", "unmap", "release", "reserve", "address_free")):
+            calls, ns, failures = values[2 + index * 3:5 + index * 3]
+            result.update({name + "_calls": calls, name + "_host_seconds": ns / 1e9,
+                           name + "_failed_calls": failures})
+        result.update(pool_reuse_calls=int(values[23]), pool_new_backings=int(values[24]),
+                      pool_observed_peak_mapped_bytes=int(values[25]))
+        if version == 2:
+            for offset, name in ((26, "access_retry_sync"), (29, "fault_range")):
+                result.update({name + "_calls": int(values[offset]),
+                               name + "_host_seconds": values[offset + 1] / 1e9})
+            result["access_retry_sync_failed_calls"] = int(values[28])
+            for index, name in enumerate(("success", "not_ready", "out_of_memory", "other")):
+                result["access_return_" + name + "_calls"] = int(values[32 + index])
+        return result
+
     def torch_pool_stats(self) -> dict[str, int | float]:
         """Optional unique-backing pool snapshot, native schema v1; never CUDA."""
         fn = getattr(self._library, "ddo_vmm_torch_pool_stats_v1", None)

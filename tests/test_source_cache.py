@@ -16,6 +16,30 @@ pytestmark = pytest.mark.vmm
 PAGE = 2 * 2**20
 
 
+def test_pressure_observations_snapshot_on_live_cache(runtime, tmp_path):
+    """Small observational gate; never forces machine-wide memory pressure."""
+    torch, lib = runtime
+    path = tmp_path / "pressure-observations.bin"
+    path.write_bytes(b"\x33" * PAGE)
+    with lib.open_source_file(path) as source, lib.create_source_cache(
+        slot_bytes=PAGE, slots=1, persistent_buffer=True, process_limit_bytes=PAGE,
+    ) as cache:
+        before = cache.snapshot()
+        assert before["pressure_observation_schema_version"] == 1
+        assert before["pressure_observation_valid_observations"] == 0
+        with cache.request(source, 0, 16) as ticket:
+            assert ticket is not None
+            ticket.wait()
+        after = cache.snapshot()
+        assert after["pressure_observation_valid_observations"] >= 1
+        assert after["pressure_observation_low_bytes"] == 2**30 + PAGE
+        assert after["pressure_observation_high_bytes"] == 2**30 + 2 * PAGE
+        assert after["pressure_observation_failed_observations"] == 0
+        assert after["pressure_observation_min_ram_bytes"] > 0
+        assert after["pressure_observation_min_commit_bytes"] > 0
+        assert after["retained_bytes"] == PAGE
+
+
 def test_persistent_storage_survives_registration_recycling_without_reread(runtime, tmp_path):
     """Two retained segments, one registered segment, live DMA tickets."""
     torch, lib = runtime

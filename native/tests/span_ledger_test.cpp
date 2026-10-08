@@ -134,6 +134,28 @@ int main() {
     require(empty_failure.quarantine_idle_backing());
     require(!empty_failure.fit_size(512, 0) && !empty_failure.releasable());
     conserved(empty_failure);
+
+    // Opportunistic cache trimming requires complete backing, not merely the
+    // absence of live leases. Keep every pending byte/fence until proven done;
+    // allocation pressure may supply that proof by waiting outside the lock.
+    SpanLedger trim(2048, 0, 9);
+    const auto trim_a = trim.reserve(1024, 0);
+    const auto trim_b = trim.reserve(1024, 0);
+    require(trim.publish(*trim_a, true) && trim.publish(*trim_b, true));
+    require(trim.retire(*trim_a, consumer_a) && trim.retire(*trim_b, consumer_b));
+    require(trim.snapshot().leased == 0 && trim.snapshot().pending == 2048);
+    require(!trim.releasable() && !trim.begin_backing_release());
+    trim.observe(consumer_a, SpanCompletion::complete);
+    trim.observe(consumer_b, SpanCompletion::not_ready);
+    require(trim.snapshot().available == 1024 && trim.snapshot().pending == 1024);
+    require(!trim.releasable() && !trim.begin_backing_release());
+    require(trim.pending_fences().size() == 1 && trim.pending_fences()[0] == consumer_b);
+    conserved(trim);
+    trim.observe(consumer_b, SpanCompletion::complete);
+    require(trim.releasable() && trim.pending_fences().empty());
+    require(trim.begin_backing_release() && !trim.reserve(512, 0));
+    require(trim.commit_backing_release() && trim.snapshot().mapped == 0);
+    conserved(trim);
     std::printf("Span ledger CPU contracts: %s (%zu checks)\n", failures ? "FAIL" : "PASS", checks);
     return failures ? 1 : 0;
 }

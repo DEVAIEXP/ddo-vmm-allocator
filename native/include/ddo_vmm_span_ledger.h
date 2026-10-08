@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <vector>
+#include <utility>
 
 namespace ddo_vmm_detail {
 
@@ -76,6 +77,53 @@ public:
             if ((span.state == SpanState::available || span.state == SpanState::pending)
                 && span.size >= *size && (!best || span.size < *best)) best = span.size;
         return best;
+    }
+
+    // Opt-in fallback only: the legacy single-span best fit remains preferred.
+    // Reserve a contiguous idle prefix while retaining every predecessor fence.
+    std::optional<Lease> reserve_joined(size_t requested, int device) {
+        if (auto single = reserve(requested, device)) return single;
+        if (released_ || release_pending_ || device != device_ || next_id_ == UINT64_MAX) return {};
+        const auto size = aligned_size(requested);
+        if (!size) return {};
+        const auto [first, fit] = joined_run(*size);
+        if (!fit) return {};
+        auto last = first;
+        size_t remaining = *size;
+        std::vector<SpanFenceOwner> dependencies;
+        for (;;) {
+            for (const auto& fence : last->dependencies) {
+                bool found = false;
+                for (const auto& retained : dependencies) found |= retained == fence;
+                if (!found) dependencies.push_back(fence);
+            }
+            if (remaining <= last->size) break;
+            remaining -= last->size;
+            ++last;
+        }
+        Lease lease{this, generation_, next_id_, first->offset, *size, requested, dependencies};
+        // Allocate/copy every replacement before touching the production list.
+        // Splice/erase then commit without throwing or losing a predecessor.
+        std::list<Span> replacement;
+        replacement.push_back({first->offset, *size, requested, next_id_,
+                               SpanState::reserved, std::move(dependencies)});
+        if (remaining < last->size)
+            replacement.push_back({last->offset + remaining, last->size - remaining,
+                                   0, 0, last->state, last->dependencies});
+        const auto after = std::next(last);
+        spans_.splice(first, replacement);
+        spans_.erase(first, after);
+        ++next_id_;
+        return lease;
+    }
+
+    std::optional<size_t> fit_size_joined(size_t requested, int device) const {
+        if (auto single = fit_size(requested, device)) return single;
+        if (released_ || release_pending_ || device != device_ || next_id_ == UINT64_MAX) return {};
+        const auto size = aligned_size(requested);
+        if (!size) return {};
+        const auto fit = joined_run(*size).second;
+        return fit ? std::optional<size_t>(fit) : std::nullopt;
     }
 
     std::vector<SpanFenceOwner> pending_fences() const {
@@ -234,6 +282,37 @@ private:
                 && it->requested == lease.requested && it->state == state) return it;
         return spans_.end();
     }
+    auto joined_run(size_t size) const
+        -> std::pair<std::list<Span>::const_iterator, size_t> {
+        auto best = spans_.end();
+        size_t best_size = 0;
+        auto first = spans_.end();
+        size_t total = 0, end = 0;
+        auto consider = [&]() {
+            if (total >= size && (!best_size || total < best_size)) {
+                best = first;
+                best_size = total;
+            }
+        };
+        for (auto it = spans_.begin(); it != spans_.end(); ++it) {
+            if (it->state != SpanState::available && it->state != SpanState::pending) {
+                consider();
+                first = spans_.end();
+                total = 0;
+                continue;
+            }
+            if (first == spans_.end() || end != it->offset) {
+                consider();
+                first = it;
+                total = 0;
+            }
+            total += it->size;
+            end = it->offset + it->size;
+        }
+        consider();
+        return {best, best_size};
+    }
+
     void coalesce() {
         for (auto it = spans_.begin(); it != spans_.end();) {
             auto next = std::next(it);

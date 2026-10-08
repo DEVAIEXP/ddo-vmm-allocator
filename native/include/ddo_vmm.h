@@ -269,6 +269,10 @@ DDO_VMM_API ddo_vmm_status ddo_vmm_source_cache_trim(
     ddo_vmm_source_cache* cache, uint64_t target_registered_bytes);
 DDO_VMM_API ddo_vmm_status ddo_vmm_source_cache_snapshot(
     ddo_vmm_source_cache* cache, ddo_vmm_source_cache_stats* stats);
+/** Optional pressure observations v1: exactly 23 uint64 values.
+ * Preserves the stats ABI and performs no OS/CUDA sampling. */
+DDO_VMM_API ddo_vmm_status ddo_vmm_source_cache_pressure_snapshot_v1(
+    ddo_vmm_source_cache* cache, uint64_t* values, size_t count);
 /** BUSY leaves the handle alive when tickets still own it. Caller serializes
  * destruction against all calls on this handle, including ticket operations. */
 DDO_VMM_API ddo_vmm_status ddo_vmm_source_cache_close(ddo_vmm_source_cache** cache);
@@ -564,6 +568,22 @@ DDO_VMM_API int ddo_vmm_torch_allocation_footprint_v1(uint64_t* values, size_t c
  * Read-only ledger snapshot, no CUDA calls. Failure leaves output untouched.
  */
 DDO_VMM_API int ddo_vmm_torch_pool_stats_v1(uint64_t* values, size_t count);
+
+/** Diagnostic-only process scope. Enable returns 1 if already owned, 2 if unsupported.
+ * Snapshot: schema, enabled, seven (calls, host ns, failed calls) triples in
+ * create/map/access/unmap/release/reserve/address-free order, pool reuse calls,
+ * pool new backings, observed pool mapped-byte high-water mark. Count must be 26.
+ * Reads do not invoke CUDA. Concurrent updates are not an atomic allocation census.
+ */
+DDO_VMM_API int ddo_vmm_allocation_diagnostics_enable_v1(int enabled);
+DDO_VMM_API int ddo_vmm_allocation_diagnostics_snapshot_v1(uint64_t* values, size_t count);
+/* Optional v2: count 36, same v1 fields with schema=2; indices 26..31 are
+ * triples for access-retry context sync and enclosing fault host calls.
+ * Fault failed-count field is unavailable/reserved zero, not success evidence.
+ * Indices 32..35 count access success/not-ready/out-of-memory/other returns.
+ * Nested timers overlap. No additional synchronization is introduced.
+ */
+DDO_VMM_API int ddo_vmm_allocation_diagnostics_snapshot_v2(uint64_t* values, size_t count);
 
 #ifdef __cplusplus
 }

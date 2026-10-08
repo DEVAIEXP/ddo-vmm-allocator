@@ -2,6 +2,7 @@
 #include "ddo_vmm_timeline.h"
 #include "ddo_vmm_source_scheduler.h"
 #include "ddo_vmm_source_flights.h"
+#include "ddo_vmm_pressure_observations.h"
 #include "source_io.h"
 #include "host_accounting.h"
 #include "host_platform.h"
@@ -105,6 +106,7 @@ struct ddo_vmm_source_cache {
     std::vector<ddo_vmm_source_ticket*> transfers;
     std::vector<std::shared_ptr<Entry>> entries;
     ddo_vmm_source_cache_stats stats{};
+    ddo_vmm_detail::PressureObservations pressure_observations;
     std::unique_ptr<ddo_vmm_detail::SourceReadScheduler> read_scheduler;
     std::condition_variable read_available;
     std::thread read_dispatcher;
@@ -438,24 +440,42 @@ ddo_vmm_status trim_ready_tail(ddo_vmm_source_cache* cache, uint64_t target, boo
 ddo_vmm_status poll_pressure(ddo_vmm_source_cache* cache) {
 #if defined(_WIN32) || defined(__linux__)
     ddo_host_platform::Headroom memory{};
-    if (!ddo_host_platform::headroom(memory)) {
-        cache->pressure_suspended = true;
-        return DDO_VMM_SUCCESS;
-    }
-    uint64_t available = std::min(memory.ram, memory.commit);
+    auto& observations = cache->pressure_observations;
     const uint64_t low = saturating_add(cache->host_headroom, cache->slot_size);
     const uint64_t high = saturating_add(low, cache->slot_size);
+    const bool was_suspended = cache->pressure_suspended;
+    if (!ddo_host_platform::headroom(memory)) {
+        cache->pressure_suspended = true;
+        observations.sample(false, 0, 0, low, high);
+        observations.transition(was_suspended, true, false, 0, 0, low,
+            cache->stats.committed_bytes, cache->stats.registered_bytes);
+        return DDO_VMM_SUCCESS;
+    }
+    observations.sample(true, memory.ram, memory.commit, low, high);
+    uint64_t available = std::min(memory.ram, memory.commit);
     if (available < low) cache->pressure_suspended = true;
     else if (available >= high) cache->pressure_suspended = false;
+    observations.transition(was_suspended, cache->pressure_suspended, true,
+        memory.ram, memory.commit, low, cache->stats.committed_bytes, cache->stats.registered_bytes);
     while (cache->pressure_suspended && available < high && cache->stats.committed_bytes) {
+        const auto before_bytes = cache->stats.committed_bytes;
         const auto target = cache->stats.committed_bytes - cache->slot_size;
         auto status = trim_ready_tail(cache, target, true);
-        if (status == DDO_VMM_BUSY) break;
-        if (status != DDO_VMM_SUCCESS) return status;
-        if (!ddo_host_platform::headroom(memory)) break;
+        observations.reclaimed(before_bytes - cache->stats.committed_bytes);
+        if (status == DDO_VMM_BUSY) { observations.blocked(); break; }
+        if (status != DDO_VMM_SUCCESS) { observations.failed(); return status; }
+        if (!ddo_host_platform::headroom(memory)) {
+            observations.sample(false, 0, 0, low, high);
+            break;
+        }
+        observations.sample(true, memory.ram, memory.commit, low, high);
         available = std::min(memory.ram, memory.commit);
     }
-    if (available >= high) cache->pressure_suspended = false;
+    if (available >= high) {
+        observations.transition(cache->pressure_suspended, false, true,
+            memory.ram, memory.commit, low, cache->stats.committed_bytes, cache->stats.registered_bytes);
+        cache->pressure_suspended = false;
+    }
     return DDO_VMM_SUCCESS;
 #else
     (void)cache;
@@ -1031,6 +1051,18 @@ extern "C" ddo_vmm_status ddo_vmm_source_cache_trim(
         }
         status = trim_ready_tail(cache, target_registered_bytes);
         return status == DDO_VMM_BUSY ? failure(status, "live or filling tail entry prevents trim") : status;
+    });
+}
+
+extern "C" ddo_vmm_status ddo_vmm_source_cache_pressure_snapshot_v1(
+    ddo_vmm_source_cache* cache, uint64_t* values, size_t count) {
+    return boundary([&]() -> ddo_vmm_status {
+        if (!cache || !values || count != ddo_vmm_detail::PressureObservations::count)
+            return failure(DDO_VMM_INVALID_ARGUMENT, "pressure snapshot v1 requires live cache and 23 values");
+        std::lock_guard<std::mutex> lock(cache->mutex);
+        std::copy(cache->pressure_observations.values.begin(),
+                  cache->pressure_observations.values.end(), values);
+        return DDO_VMM_SUCCESS;
     });
 }
 

@@ -2,6 +2,7 @@
 #include "ddo_vmm_torch_pool.h"
 #include "ddo_vmm_span_ledger.h"
 #include "ddo_vmm_stream_dependency.h"
+#include "ddo_vmm_allocation_diagnostics.h"
 #include <cuda.h>
 #include <atomic>
 #include <chrono>
@@ -103,9 +104,24 @@ bool evict_one(bool over_limit_only) {
             const auto mapped = owner->ledger.snapshot().mapped;
             if (mapped > SIZE_MAX - idle_bytes) return false;
             idle_bytes += mapped;
+        }
+        if (over_limit_only && idle_bytes <= cache_limit()) return false;
+        for (const auto& owner : backings) {
+            if (owner->retiring || !idle(*owner)) continue;
+            // Cache trimming must not wait for outstanding consumer work.
+            // Query completion only; allocation-pressure eviction below still
+            // waits for pending events before releasing physical backing.
+            if (over_limit_only) {
+                reap(*owner);
+                if (!idle(*owner)) continue; // Failed query quarantined it.
+            }
+            const auto mapped = owner->ledger.snapshot().mapped;
+            // In-flight idle bytes remain mapped, accounted and reusable via
+            // stream dependencies. They are not permission to grow budgets.
+            if (over_limit_only && !owner->ledger.releasable()) continue;
             if (!selected || mapped < selected->ledger.snapshot().mapped) selected = owner;
         }
-        if (!selected || (over_limit_only && idle_bytes <= cache_limit())) return false;
+        if (!selected) return false;
         fences = selected->ledger.pending_fences();
         selected->retiring = true;
     }
@@ -153,7 +169,11 @@ bool evict_one(bool over_limit_only) {
 }
 
 void* publish_locked(const std::shared_ptr<Backing>& owner, size_t bytes, cudaStream_t stream) {
+#ifdef DDO_VMM_NATIVE_JOINED_SPANS
+    auto lease = owner->ledger.reserve_joined(bytes, owner->device);
+#else
     auto lease = owner->ledger.reserve(bytes, owner->device);
+#endif
     if (!lease) return nullptr;
     for (const auto& dependency : lease->dependencies) {
         const auto fence = std::static_pointer_cast<const CudaFence>(dependency);
@@ -206,10 +226,20 @@ void* ddo_vmm_pool_malloc(size_t bytes, int device, cudaStream_t stream) noexcep
                 for (const auto& owner : backings) {
                     if (owner->retiring || owner->context != context || owner->device != device) continue;
                     if (pass) reap(*owner);
+#ifdef DDO_VMM_NATIVE_JOINED_SPANS
+                    const auto fit = owner->ledger.fit_size_joined(bytes, device);
+#else
                     const auto fit = owner->ledger.fit_size(bytes, device);
+#endif
                     if (fit && (!best || *fit < best_size)) { best = owner; best_size = *fit; }
                 }
-                if (best) return publish_locked(best, bytes, stream);
+                if (best) {
+                    auto pointer = publish_locked(best, bytes, stream);
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+                    if (pointer) allocation_diagnostics.pool_reuse();
+#endif
+                    return pointer;
+                }
             }
         }
         if (ddo_vmm_pressure_prepare_cuda_allocation(device, mapped) != DDO_VMM_SUCCESS) {
@@ -228,6 +258,13 @@ void* ddo_vmm_pool_malloc(size_t bytes, int device, cudaStream_t stream) noexcep
         if (next_generation == UINT64_MAX) return nullptr;
         auto owner = std::make_shared<Backing>(std::move(region), device, context, next_generation++);
         backings.push_back(owner);
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+        if (allocation_diagnostics.enabled.load(std::memory_order_relaxed)) {
+            uint64_t pool_mapped = 0;
+            for (const auto& backing : backings) pool_mapped += backing->ledger.snapshot().mapped;
+            allocation_diagnostics.pool_backing(pool_mapped);
+        }
+#endif
         return publish_locked(owner, bytes, stream);
     } catch (...) { failures.fetch_add(1, std::memory_order_relaxed); return nullptr; }
 }

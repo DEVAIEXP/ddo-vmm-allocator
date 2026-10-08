@@ -10,6 +10,30 @@ from .native import NativeVmmError
 from .source import NativeSourceError
 
 
+_PRESSURE_FIELDS = (
+    "schema_version", "valid_observations", "failed_observations", "entries", "recoveries",
+    "ram_limited_entries", "commit_limited_entries", "both_limited_entries", "unknown_entries",
+    "last_reason", "last_entry_ram_bytes", "last_entry_commit_bytes", "last_entry_committed_bytes",
+    "last_entry_registered_bytes", "last_recovery_ram_bytes", "last_recovery_commit_bytes",
+    "min_ram_bytes", "min_commit_bytes", "low_bytes", "high_bytes",
+    "last_episode_reclaimed_bytes", "blocked_reclaims", "failed_reclaims",
+)
+
+
+def _pressure_snapshot(dll, handle, check):
+    """Older binaries omit observations rather than reporting invented zeros."""
+    snapshot = getattr(dll, "ddo_vmm_source_cache_pressure_snapshot_v1", None)
+    if snapshot is None:
+        return {}
+    snapshot.argtypes = [c.c_void_p, c.POINTER(c.c_uint64), c.c_size_t]
+    snapshot.restype = c.c_int
+    values = (c.c_uint64 * len(_PRESSURE_FIELDS))()
+    check(snapshot(handle, values, len(values)))
+    if values[0] != 1:
+        raise NativeVmmError("unsupported native pressure-observation schema")
+    return {"pressure_observation_" + name: value for name, value in zip(_PRESSURE_FIELDS, values)}
+
+
 def _close_context_owner(owner, original_error):
     """Keep the operation's first error visible when protected close fails."""
     _run_cleanup_preserving_error(owner.close, type(owner).__name__, original_error)
@@ -197,6 +221,7 @@ class NativeSourceCache:
             result = {name: getattr(stats, name) for name, _ in _Stats._fields_
                       if getattr(_Stats, name).offset < stats.struct_size}
             result.update(getattr(self, "_batch_timings", {}))
+            result.update(_pressure_snapshot(self._dll, self._handle, self._check))
             event_snapshot = getattr(self._dll, "ddo_vmm_source_owned_events_v1", None)
             if event_snapshot is not None:
                 event_snapshot.argtypes = [c.c_void_p] + [c.POINTER(c.c_size_t)] * 3

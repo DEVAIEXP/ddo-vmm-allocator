@@ -2,10 +2,26 @@ cmake_minimum_required(VERSION 3.25)
 
 project(ddo_vmm_allocator VERSION 0.1.0 LANGUAGES CXX)
 
+option(DDO_VMM_BUILD_EXECUTION_OPS "Build experimental independent CUDA execution kernels" OFF)
+if(DDO_VMM_BUILD_EXECUTION_OPS)
+    enable_language(CUDA)
+    add_library(ddo_execution_ops SHARED native/src/ddo_execution_ops.cu)
+    target_include_directories(ddo_execution_ops PUBLIC native/include)
+    set_target_properties(ddo_execution_ops PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
+    target_compile_definitions(ddo_execution_ops PRIVATE DDO_EXECUTION_OPS_BUILD=1)
+    # Preserve explicit intermediate rounding; never enable fast math.
+    target_compile_options(ddo_execution_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+endif()
+
 option(DDO_VMM_BUILD_PROBES "Build standalone CUDA Driver VMM probes" ON)
 option(DDO_VMM_NATIVE_SPAN_POOL "Build the unpromoted native span-pool candidate" OFF)
+option(DDO_VMM_NATIVE_JOINED_SPANS "Enable experimental dependency-preserving multi-span reservations" OFF)
+if(DDO_VMM_NATIVE_JOINED_SPANS AND NOT DDO_VMM_NATIVE_SPAN_POOL)
+    message(FATAL_ERROR "DDO_VMM_NATIVE_JOINED_SPANS requires DDO_VMM_NATIVE_SPAN_POOL")
+endif()
 option(DDO_VMM_NATIVE_SOURCE_DISPATCHER "Build the unpromoted asynchronous source dispatcher" OFF)
 option(DDO_VMM_SOURCE_TEST_HOOKS "Enable isolated source lifecycle fault injection (never production)" OFF)
+option(DDO_VMM_ALLOCATION_DIAGNOSTICS "Build opt-in host driver allocation timing (diagnostic only)" OFF)
 
 # NVIDIA's Linux Python toolkit has a versioned runtime library but may lack
 # the unversioned development symlink FindCUDAToolkit expects. This target uses
@@ -28,6 +44,9 @@ add_library(ddo_vmm SHARED
 
 target_compile_features(ddo_vmm PRIVATE cxx_std_20)
 target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_BUILDING_LIBRARY=1)
+if(DDO_VMM_ALLOCATION_DIAGNOSTICS)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_ALLOCATION_DIAGNOSTICS=1)
+endif()
 target_include_directories(ddo_vmm
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/native/include>
@@ -43,6 +62,9 @@ if(DDO_VMM_NATIVE_SPAN_POOL)
     target_sources(ddo_vmm PRIVATE native/src/ddo_vmm_torch_pool.cpp)
     target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_NATIVE_SPAN_POOL=1)
 endif()
+if(DDO_VMM_NATIVE_JOINED_SPANS)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_NATIVE_JOINED_SPANS=1)
+endif()
 
 if(WIN32)
     target_link_libraries(ddo_vmm PRIVATE dxgi)
@@ -55,6 +77,9 @@ else()
 endif()
 
 if(DDO_VMM_BUILD_PROBES)
+    add_executable(ddo_vmm_allocation_diagnostics_test native/tests/allocation_diagnostics_test.cpp)
+    target_compile_features(ddo_vmm_allocation_diagnostics_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_allocation_diagnostics_test PRIVATE native/include)
     # Pure CPU contracts: no CUDA library, context or device initialization.
     add_executable(ddo_vmm_source_flights_test native/tests/source_flights_test.cpp)
     target_compile_features(ddo_vmm_source_flights_test PRIVATE cxx_std_20)
@@ -68,6 +93,9 @@ if(DDO_VMM_BUILD_PROBES)
     add_executable(ddo_vmm_span_ledger_test native/tests/span_ledger_test.cpp)
     target_compile_features(ddo_vmm_span_ledger_test PRIVATE cxx_std_20)
     target_include_directories(ddo_vmm_span_ledger_test PRIVATE native/include)
+    add_executable(ddo_vmm_span_joined_test native/tests/span_joined_test.cpp)
+    target_compile_features(ddo_vmm_span_joined_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_span_joined_test PRIVATE native/include)
     add_executable(ddo_vmm_cache_selection_test native/tests/cache_selection_test.cpp)
     target_compile_features(ddo_vmm_cache_selection_test PRIVATE cxx_std_20)
     target_include_directories(ddo_vmm_cache_selection_test PRIVATE native/include)
