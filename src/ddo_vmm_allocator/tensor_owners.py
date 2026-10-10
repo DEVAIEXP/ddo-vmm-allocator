@@ -50,10 +50,7 @@ class TensorOwnerGroup:
 
         if self.state != "prepared":
             raise RuntimeError("Tensor view has already been published or needs rollback")
-        if not isinstance(view, torch.Tensor) or view.device.type == "meta":
-            raise ValueError("Publication requires a materialized tensor view")
-        if tuple(view.shape) != self.shape or view.dtype != self.dtype or not view.is_contiguous():
-            raise ValueError("Native view shape/dtype/contiguity differs from the captured tensor")
+        self._validate_publication_view(view)
         for module, key, _ in self.owners:
             if self._table(module).get(key) is not self._original:
                 raise RuntimeError("A tensor owner changed before publication")
@@ -69,6 +66,21 @@ class TensorOwnerGroup:
         self._original = None
         self.state = "published"
         return self._published
+
+    def _validate_publication_view(self, view):
+        import torch
+
+        if not isinstance(view, torch.Tensor) or view.device.type == "meta":
+            raise ValueError("Publication requires a materialized tensor view")
+        if tuple(view.shape) != self.shape or view.dtype != self.dtype or not view.is_contiguous():
+            raise ValueError("Native view shape/dtype/contiguity differs from the captured tensor")
+
+    def _make_retirement_placeholder(self):
+        import torch
+
+        placeholder = torch.empty(self.shape, dtype=self.dtype, device="meta")
+        return (torch.nn.Parameter(placeholder, requires_grad=False)
+                if self.kind == "parameter" else placeholder)
 
     def rollback_failed_publication(self):
         """Retry-safe rollback, only before publication has ever succeeded."""
@@ -108,9 +120,7 @@ class TensorOwnerGroup:
             if value is not self._published and (self._placeholder is None or value is not self._placeholder):
                 raise RuntimeError("A published tensor owner changed before retirement")
         if self._placeholder is None:
-            placeholder = torch.empty(self.shape, dtype=self.dtype, device="meta")
-            self._placeholder = (torch.nn.Parameter(placeholder, requires_grad=False)
-                                 if self.kind == "parameter" else placeholder)
+            self._placeholder = self._make_retirement_placeholder()
         self.state = "retiring"
         for module, key, _ in self.owners:
             self._table(module)[key] = self._placeholder

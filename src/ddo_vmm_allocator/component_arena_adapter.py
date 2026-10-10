@@ -22,12 +22,17 @@ class ComponentLayout:
     units: tuple  # name, module, parameter group indexes
     payload_bytes: int
     buffer_bytes: int
+    component_lifetime_parameters: tuple = ()  # group, immutable descriptor
 
     def snapshot(self):
-        return {"schema_version": 1, "parameter_groups": len(self.parameters),
+        result = {"schema_version": 1, "parameter_groups": len(self.parameters),
                 "buffer_groups": sum(group.kind == "buffer" for group in self.groups),
                 "payload_bytes": self.payload_bytes, "buffer_bytes": self.buffer_bytes,
                 "execution_units": len(self.units), "lookahead": False}
+        if self.component_lifetime_parameters:
+            result.update(component_lifetime_parameter_groups=len(self.component_lifetime_parameters),
+                          component_lifetime_parameter_bytes=sum(g.nbytes for g, _ in self.component_lifetime_parameters))
+        return result
 
     def capacity_snapshot(self):
         """Detached loaded-source geometry; no native allocation/admission."""
@@ -41,17 +46,23 @@ class ComponentLayout:
         largest = max(unit["execution_slot_payload_bytes"] for unit in units)
         return {**self.snapshot(), "observation": "loaded_source_preflight",
                 "native_admission_validated": False,
-                "unique_parameter_bytes": sum(group.nbytes for group, _, _ in self.parameters),
+                "unique_parameter_bytes": (sum(group.nbytes for group, _, _ in self.parameters)
+                                           + sum(g.nbytes for g, _ in self.component_lifetime_parameters)),
                 "execution_slot_count": 2, "execution_slot_payload_bytes": largest,
                 "execution_slot_total_payload_bytes": 2 * largest,
                 "units": units}
 
 
-def discover_component_layout(root, file_slices, *, buffer_limit_bytes):
+def discover_component_layout(root, file_slices, *, buffer_limit_bytes, _prepared_groups=None,
+                              _component_lifetime_root_limit_bytes=None):
     """Preflight before any allocator operation or module mutation."""
     if type(buffer_limit_bytes) is not int or buffer_limit_bytes < 0:
         raise ValueError("component buffer limit must be a non-negative byte integer")
-    groups = capture_model_tensor_owners(root)
+    if (_component_lifetime_root_limit_bytes is not None
+            and (type(_component_lifetime_root_limit_bytes) is not int
+                 or _component_lifetime_root_limit_bytes < 0)):
+        raise ValueError("component-lifetime root limit must be a non-negative byte integer")
+    groups = capture_model_tensor_owners(root) if _prepared_groups is None else _prepared_groups
     modules = dict(root.named_modules())
     list_items = {}
     import torch
@@ -66,6 +77,7 @@ def discover_component_layout(root, file_slices, *, buffer_limit_bytes):
                 list_items[f"{path}.{index}" if path else str(index)] = child
     parameters, units, offset = [], {}, 0
     buffers = 0
+    lifetime, lifetime_bytes = [], 0
     for group in groups:
         source = group.loader_tensor
         if source.device.type != "cpu" or not source.is_contiguous() or not source.numel():
@@ -76,6 +88,12 @@ def discover_component_layout(root, file_slices, *, buffer_limit_bytes):
         descriptor = file_slices.lookup(source) if file_slices is not None else None
         if descriptor is None:
             raise ValueError(f"component parameter has no immutable file source: {group.snapshot()['names']}")
+        if _component_lifetime_root_limit_bytes is not None and any(owner is root for owner, _, _ in group.owners):
+            if not all(owner is root for owner, _, _ in group.owners) or type(source) is not torch.nn.Parameter:
+                raise ValueError("component-lifetime root state requires plain parameters with root-only owners")
+            lifetime.append((group, descriptor))
+            lifetime_bytes += group.nbytes
+            continue
         offset = _align_up(offset, max(source.element_size(), 256))
         position = len(parameters)
         parameters.append((group, offset, descriptor))
@@ -84,13 +102,17 @@ def discover_component_layout(root, file_slices, *, buffer_limit_bytes):
             path = names[0].rsplit(".", 1)[0] if "." in names[0] else ""
             ancestors = [".".join(path.split(".")[:index]) for index in range(1, len(path.split(".")) + 1)]
             unit = next((parent for parent in ancestors if parent in list_items), path)
-            entry = units.setdefault(unit, [list_items.get(unit, owner), []])
+            execution_owner = getattr(owner, "_ddo_execution_module", owner)
+            entry = units.setdefault(unit, [list_items.get(unit, execution_owner), []])
             if position not in entry[1]:
                 entry[1].append(position)
     if not parameters:
         raise ValueError("component has no file-backed parameters")
     if buffers > buffer_limit_bytes:
         raise ValueError("component buffers exceed the explicit device-buffer limit")
+    if (_component_lifetime_root_limit_bytes is not None
+            and buffers + lifetime_bytes > _component_lifetime_root_limit_bytes):
+        raise ValueError("component-lifetime root state and buffers exceed the explicit component limit")
     names = list(units)
     if "" in units and len(units) > 1:
         raise ValueError("overlapping direct-parameter execution units are not supported")
@@ -109,7 +131,7 @@ def discover_component_layout(root, file_slices, *, buffer_limit_bytes):
     units = merged
     return ComponentLayout(groups, tuple(parameters),
                            tuple((name, module, tuple(indices)) for name, (module, indices) in units.items()),
-                           offset, buffers)
+                           offset, buffers, tuple(lifetime))
 
 
 class ComponentArenaAdapter(ModelArenaModuleAdapter):
@@ -135,6 +157,10 @@ class ComponentArenaAdapter(ModelArenaModuleAdapter):
         event.record(torch.cuda.current_stream(self.store._device_ordinal))
         return event
 
+    def _publish_component_lifetime_parameters(self, parameters):
+        if parameters:
+            raise ModelArenaError("component-lifetime root state requires an explicit dedicated adapter")
+
     def attach_component(self, layout):
         self._ownership_groups = layout.groups
         self.component_report = layout.snapshot()
@@ -157,6 +183,7 @@ class ComponentArenaAdapter(ModelArenaModuleAdapter):
         for group in layout.groups:
             if group.kind == "buffer":
                 group.publish(self._move_buffer(group.loader_tensor))
+        self._publish_component_lifetime_parameters(layout.component_lifetime_parameters)
         for name, module, indices in layout.units:
             state = _ModuleBinding(name, module, [bindings[index] for index in indices], {},
                                    guard_reentry=True)

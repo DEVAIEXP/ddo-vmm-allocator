@@ -297,6 +297,20 @@ class _ExecutionLease:
     ready: Any
 
 
+class _CompletionSet:
+    """Retain both upload and compute completion for partial composite fallback."""
+
+    def __init__(self, events):
+        self.events = tuple(events)
+
+    def query(self):
+        return all(event.query() is True for event in self.events)
+
+    def synchronize(self):
+        for event in self.events:
+            event.synchronize()
+
+
 class NativeExecutionBuffers:
     """Two native slots, immutable unit layouts and native-owned rotation."""
 
@@ -1094,6 +1108,11 @@ class ModelArenaWeightStore:
         result["execution_buffer_slots"] = buffer.pool.slots if isinstance(buffer, NativeExecutionBuffers) else 1 if buffer is not None else 0
         result["execution_buffer_slot_bytes"] = buffer.pool.capacity_bytes if isinstance(buffer, NativeExecutionBuffers) else buffer.capacity_bytes if buffer is not None else 0
         result["total_weight_resident_bytes"] = result["resident_bytes"] + result["execution_buffer_resident_bytes"]
+        lifetime = getattr(self, "_component_lifetime_buffer", None)
+        if lifetime is not None:
+            result["component_lifetime_capacity_bytes"] = lifetime.capacity_bytes
+            result["component_lifetime_resident_bytes"] = lifetime.native.info.resident_size
+            result["total_weight_resident_bytes"] += result["component_lifetime_resident_bytes"]
         result["fault_ceiling_bytes"] = info.fault_ceiling
         result["virtual_bytes"] = info.virtual_size
         result["page_bytes"] = info.page_size
@@ -1957,6 +1976,13 @@ class ModelArenaModuleAdapter:
                     with suppress(NativeVmmError):
                         self.store.unpin(binding)
                 temporary_views: list[tuple[_TensorBinding, Any]] = []
+                composite_ownership = getattr(state, "composite_payload_ownership", False)
+                if composite_ownership:
+                    # Own partial fallback uploads before any wait/publication
+                    # can fail. The component boundary then fences their cleanup.
+                    state.temporary_views = temporary_views
+                    state.temporary_ready_events = []
+                    state.active = True
                 for binding in state.tensors:
                     if self.store._debug_faults:
                         print(
@@ -1965,8 +1991,12 @@ class ModelArenaModuleAdapter:
                             flush=True,
                         )
                     temporary, ready_event = self.store.temporary_cuda_source(binding)
+                    if composite_ownership:
+                        temporary_views.append((binding, temporary))
+                        state.temporary_ready_events.append(ready_event)
                     self.store.wait_for_compute(ready_event)
-                    temporary_views.append((binding, temporary))
+                    if not composite_ownership:
+                        temporary_views.append((binding, temporary))
                     binding.owner._parameters[binding.parameter_name].data = temporary
                     self.store.record_temporary(binding.nbytes)
                 if self.store._debug_faults:
@@ -1984,6 +2014,11 @@ class ModelArenaModuleAdapter:
             if not state.active:
                 return _output
             state.active = False
+            composite_ownership = getattr(state, "composite_payload_ownership", False)
+            if composite_ownership:
+                # A failed fence/restoration keeps the owning unit active;
+                # close must not free its backing while completion is unknown.
+                state.active = True
             if state.execution_buffer_active:
                 self.store.execution_buffer.finish_compute(
                     state.execution_buffer_lease,
@@ -1997,6 +2032,8 @@ class ModelArenaModuleAdapter:
             elif state.temporary_views is not None:
                 event = torch.cuda.Event(enable_timing=False)
                 event.record(torch.cuda.current_stream(self.store._device_ordinal))
+                if composite_ownership:
+                    event = _CompletionSet((event, *state.temporary_ready_events))
                 self._temporary_lifetimes.append((event, state.temporary_views))
                 for binding, _temporary in state.temporary_views:
                     binding.owner._parameters[binding.parameter_name].data = binding.stable
@@ -2009,6 +2046,8 @@ class ModelArenaModuleAdapter:
                 event = torch.cuda.Event(enable_timing=False)
                 event.record(torch.cuda.current_stream(self.store._device_ordinal))
                 self._pending_unpins.append((event, list(state.tensors)))
+            if composite_ownership:
+                state.active = False
             if self.store._native_shard_transport is not None and _output is not None:
                 self._prefetch_next_unit(state, materialize=True)
             return _output
