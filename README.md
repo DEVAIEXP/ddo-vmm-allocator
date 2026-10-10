@@ -38,6 +38,16 @@ The VMM lifecycle is designed for CUDA on Windows and Linux.  Both platforms sup
 
 ## Development status
 
+October 10, 2026 delivery update: an opt-in wheel build can assemble an existing,
+explicitly hash-selected AMD64 DLL under `ddo_vmm_allocator/native/win32/`.
+The installed DDO bootstrap discovers it automatically; normal adapter builds
+remain pure Python and never compile/download a DLL at execution time. The local
+Windows artifact passed packaging and isolated CPU discovery checks, not a new
+CUDA execution gate. FP8 payload/ownership changes are Python-only; selected
+Windows DLL and Linux .so hashes remain unchanged. See the parent checkout's
+`docs/native-wheel-delivery.md` for assembly, installation and acceptance details.
+The older core-only/future-adapter wording below is historical, not current scope.
+
 Current native Linux checkpoint: source/ring/persistent-storage/cache/batches
 compile into `build-linux/libddo_vmm.so` with CPU contracts passed; the approved
 allocator probe and seven small CUDA contracts also passed. The corrected library
