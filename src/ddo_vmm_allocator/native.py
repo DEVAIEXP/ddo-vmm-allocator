@@ -195,6 +195,22 @@ class NativeVmmLibrary:
         result["pool_schema_version"] = 1
         return result
 
+    def trim_idle_torch_pool(self) -> dict:
+        """Explicit native release; unsupported libraries are never replaced."""
+        function = getattr(self._library, "ddo_vmm_torch_trim_idle_v1", None)
+        if function is None:
+            return {"status": "unsupported", "trim_executed": False}
+        function.argtypes = []
+        function.restype = ctypes.c_int
+        before = self.torch_pool_stats()
+        status = int(function())
+        if status == 2:
+            return {"status": "unsupported", "trim_executed": False, "before": before}
+        if status != 0:
+            raise NativeVmmError("native idle pool trim failed; unsafe backing retained")
+        return {"status": "completed", "trim_executed": True,
+                "before": before, "after": self.torch_pool_stats()}
+
     def __init__(self, library_path: str | os.PathLike[str]) -> None:
         self.path = Path(library_path).expanduser().resolve(strict=True)
         from ._library import load_library

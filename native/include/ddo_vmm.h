@@ -569,6 +569,14 @@ DDO_VMM_API int ddo_vmm_torch_allocation_footprint_v1(uint64_t* values, size_t c
  */
 DDO_VMM_API int ddo_vmm_torch_pool_stats_v1(uint64_t* values, size_t count);
 
+/** Explicit process-wide phase-boundary trim of whole-idle native pool backing.
+ * Does not free live leases, partial backing, model arenas or quarantined bytes.
+ * Proves event completion before checked physical release; may wait.
+ * Return 0: operation completed (not a promise of zero VRAM); 1: failure with
+ * unsafe bytes retained; 2: unavailable in this build. No automatic invocation.
+ */
+DDO_VMM_API int ddo_vmm_torch_trim_idle_v1(void);
+
 /** Diagnostic-only process scope. Enable returns 1 if already owned, 2 if unsupported.
  * Snapshot: schema, enabled, seven (calls, host ns, failed calls) triples in
  * create/map/access/unmap/release/reserve/address-free order, pool reuse calls,

@@ -12,6 +12,12 @@ class TorchAllocatorInstallError(RuntimeError):
 
 
 _installed_allocator: Any | None = None
+_installed_library_path: Path | None = None
+
+
+def installed_library_path() -> Path | None:
+    """Actual installed allocator library, not a mutable environment setting."""
+    return _installed_library_path
 
 
 def install_pytorch_vmm_allocator(
@@ -25,7 +31,7 @@ def install_pytorch_vmm_allocator(
     would otherwise be gone.
     """
 
-    global _installed_allocator
+    global _installed_allocator, _installed_library_path
     if _installed_allocator is not None:
         return _installed_allocator
 
@@ -57,4 +63,5 @@ def install_pytorch_vmm_allocator(
     )
     torch.cuda.memory.change_current_allocator(allocator)
     _installed_allocator = allocator
+    _installed_library_path = path
     return allocator

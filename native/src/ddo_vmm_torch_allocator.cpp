@@ -390,6 +390,14 @@ extern "C" DDO_VMM_API int ddo_vmm_torch_pool_stats_v1(uint64_t* values, size_t 
 #endif
 }
 
+extern "C" DDO_VMM_API int ddo_vmm_torch_trim_idle_v1(void) {
+#ifdef DDO_VMM_NATIVE_SPAN_POOL
+    return ddo_vmm_pool_trim_idle();
+#else
+    return 2; // Unsupported builds must not simulate successful release.
+#endif
+}
+
 extern "C" DDO_VMM_API size_t ddo_vmm_torch_live_allocation_count(void) {
 #ifdef DDO_VMM_NATIVE_SPAN_POOL
     uint64_t values[15]{};

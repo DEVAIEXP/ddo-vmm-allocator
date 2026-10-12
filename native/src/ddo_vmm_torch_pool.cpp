@@ -297,6 +297,19 @@ void ddo_vmm_pool_free(void* pointer, cudaStream_t stream) noexcept {
     } catch (...) { failures.fetch_add(1, std::memory_order_relaxed); }
 }
 
+int ddo_vmm_pool_trim_idle() noexcept {
+    // Explicit phase boundary only. Never selects leased or quarantined backing.
+    // evict_one proves pending completion and checks unmap/release before commit.
+    const auto before = failures.load(std::memory_order_relaxed);
+    try {
+        while (evict_one(false)) {}
+        return failures.load(std::memory_order_relaxed) == before ? 0 : 1;
+    } catch (...) {
+        failures.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
+}
+
 int ddo_vmm_pool_stats(uint64_t* values, size_t count) noexcept {
     if (!values || count != 15) return 1;
     try {
