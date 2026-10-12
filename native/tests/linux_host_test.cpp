@@ -60,10 +60,14 @@ int main() {
         write(leaf / "memory.current", "50");
         write(leaf / "memory.high", "100");
         const auto mounts = "1 0 0:1 / " + fixture.root.string() + " rw - cgroup2 cgroup2 rw\n";
+        require(cgroup_headroom("0::/\n", mounts, available) && available == UINT64_MAX,
+            "root membership without memory.max preserves mount identity");
         require(cgroup_headroom("0::/child/leaf\n", mounts, available) && available == 50, "leaf high bound");
         write(leaf / "memory.high", "max");
         require(cgroup_headroom("0::/child/leaf\n", mounts, available) && available == 200, "ancestor capacity bound");
         const auto namespace_mount = "1 0 0:1 /child " + child.string() + " rw - cgroup2 cgroup2 rw\n";
+        require(cgroup_headroom("0::/child\n", namespace_mount, available) && available == 200,
+            "exact subtree mount-root membership retains memory limits");
         require(cgroup_headroom("0::/child/leaf\n", namespace_mount, available) && available == 200, "subtree mount root");
         write(child / "memory.current", "bad");
         require(!cgroup_headroom("0::/child/leaf\n", mounts, available), "malformed ancestor refused");

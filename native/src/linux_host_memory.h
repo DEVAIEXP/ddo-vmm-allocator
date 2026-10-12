@@ -96,7 +96,11 @@ inline bool cgroup_headroom(const std::string& membership, const std::string& mo
         const auto base = std::filesystem::path(mount).lexically_normal();
         std::string root_controllers;
         if (!read_text(base / "cgroup.controllers", root_controllers)) return false;
-        const auto directory = (base / std::filesystem::path(relative).relative_path()).lexically_normal();
+        // Joining an empty relative path can retain a trailing separator and
+        // make the mount root compare unequal to itself. Preserve its identity
+        // for root membership, including an exact subtree mount-root match.
+        const auto directory = relative.empty()
+            ? base : (base / std::filesystem::path(relative).relative_path()).lexically_normal();
         auto path = directory;
         bound = UINT64_MAX;
         for (size_t depth = 0; depth < 256; ++depth) {
