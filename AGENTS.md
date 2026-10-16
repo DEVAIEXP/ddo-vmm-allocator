@@ -1,94 +1,71 @@
-# Allocator guidance
-
-## Documentation Language
-
-- Write all new or updated repository documentation in English, including README files, AGENTS.md, documentation pages, handoffs, plans, benchmark commentary, and explanatory examples or docstrings.
-- Preserve verbatim quotations, raw logs, benchmark prompts, and required license or attribution text in their original form; write surrounding explanations in English. Do not change recorded evidence merely to translate it.
-- This requirement applies to repository documentation, not to conversations with the user, which may remain in the user's preferred language.
-
-## Scope
-
-This subproject provides the native CUDA Driver VMM library and the PyTorch
-adapter consumed by DDO. This is an independent implementation; do not copy
-code from external projects.
-
-## Target architecture
-
-- `native/`: a model-sized virtual range, on-demand page materialization,
-  per-generation signatures, unpinning and native LRU eviction.
-- `src/ddo_vmm_allocator/model_arena_adapter.py`: receives the actual weight
-  size, creates the single range and installs fault/copy hooks on dense modules.
-- `weight_arena.py` and `torch_module_adapter.py`: the legacy `linear_runtime`
-  path remains supported for validated presets and experiments; do not remove it.
-- The native path uses `backing=device`; under WDDM the driver may place physical
-  pages in shared memory under pressure, without switching to PyTorch's allocator.
-- Persistent sources and the registered cache belong to C++ in this submodule.
-  Sources retain descriptors and native bytes, not loader CPU tensors. Do not
-  introduce a parallel safetensors cache or Python group heuristics: residency,
-  admission and pressure belong to the native runtime.
-- Host sources and GPU arenas have distinct lifetimes. A retained handle keeps
-  the file alive after its original owner closes. Closing an owner requires
-  serialization with calls on that same handle; retained owners allow concurrent
-  reads. The future cache may recycle bytes only after I/O and every referencing
-  DMA have completed.
-- In the persistent buffer (config v5 / ABI v8), host commitment and CUDA
-  registration have separate ceilings and lifetimes. Unregistration preserves
-  bytes; subsequent DMA can register them again without rereading the file.
-  Only host pressure/clear removes content. Registration policy and its events
-  belong to C++.
-- The persistent path uses two native execution slots charged against the
-  existing GPU ceiling and immutable batch descriptors. Recycling requires the
-  last consumer's event; cancellation requires the upload event. Partial failure
-  does not release ownership without proven completion. Python submits one unit,
-  rather than managing requests/DMAs per window; views may be reused.
-
-## Safety rules
-
-1. Never deallocate/remap a region while a stream may reference it.
-2. Materialization failure must fall back to a temporary CUDA buffer and restore
-   parameters only after the relevant stream synchronization/event.
-3. Native pressure eviction must consider only unpinned pages; the virtual range
-   remains fully faultable after eviction.
-4. Every lifecycle change needs a small CUDA test before any LTX benchmark.
-
-## Required tests
-
-```powershell
-$env:PYTHONPATH='E:\ProjetosIA\diffusers-dynamic-offloader\ddo-vmm-allocator\src'
-$env:DDO_VMM_LIBRARY_PATH='E:\ProjetosIA\diffusers-dynamic-offloader\ddo-vmm-allocator\build\Release\ddo_vmm.dll'
-& 'E:\ProjetosIA\diffusers-dynamic-offloader\.venv-vmm\Scripts\python.exe' -m pytest tests -q
-```
-
-Present the command, hypothesis and approval criterion and wait for confirmation
-before any CUDA test or benchmark. `tests/test_native_source.py` tests only
-files/ownership, without initializing CUDA. Use DDO's `.venv-vmm` environment for
-both projects. Rebuild the DLL when changing `native/`; record actual gate
-results rather than treating historical test counts as the current baseline.
-
-## Integration
-
-To resume on Linux, read `../docs/linux-handoff.md` and DDO's Linux plan.
-`scripts/build_linux.py --mode cpu` builds isolated contracts without CUDA;
-`--mode library` only builds the experimental library. Neither authorizes CUDA
-tests. Use DDO's `.venv-linux` and `build-linux`, preserving Windows environments
-and binaries. A POSIX source does not imply portable cache/DMA support.
-
-Current Linux checkpoint: `../docs/native-linux-transport-gate.md`. Transport,
-mmap storage/cache/batches compiled; CPU tests and the probe/seven approved CUDA
-contracts passed. The corrected library also passed three CUDA cache contracts
-and one real staged generation with native encoder/transformer; see
-`../docs/native-linux-staged-gate.md`. New CUDA tests and model executions still
-require separate confirmation. Preserve commit/cgroup v2/process limits, with
-no automatic growth or WDDM emulation. Unregistration must preserve bytes;
-ownership/events remain native.
-
-Hosts use DDO's public API, which consumes `attach_model_linear_modules`.
-During source gates, preserve the active 4 GiB budget and approved staging;
-the host cache has a separate ceiling and does not increase the GPU budget.
-`linear_runtime` remains the stable route and must not silently redirect to the
-native arena. `vmm_runtime` is the protected NVMe baseline.
-
-## Regression prohibition
-
-Do not remove fallback, multiple-block or host-tensor tests. Do not run the
-complete model if CUDA tests fail.
+# Allocator repository guidance
+## Scope and starting points
+This independent repository owns native CUDA Driver VMM and Python adapters,
+consumed through DDO. It must remain architecture/model agnostic.
+Read README.md and docs/developer/{contracts,builds,validation,releases}.md.
+If attached as DDO's submodule, read the parent AGENTS.md too. Standalone work
+must not require parent-relative historical handoffs or ignored local records.
+## Language and evidence
+Write all new/updated documentation, comments and explanatory docstrings in English.
+Conversation may use the user's language. Preserve verbatim logs, prompts, quotes
+and required license/attribution text; never alter evidence to translate or sanitize it.
+Use docs/user for current integration, docs/developer for contributor contracts,
+and ignored .internal/documentation for handoffs/plans/intermediate investigations.
+README must index public docs. Never link public instructions to required ignored files.
+Keep a separate backup of local internal records; .gitignore is not a backup and
+does not remove previously tracked content from Git history. No implicit history rewrite.
+## Code map and contracts
+- native/src and native/include: C ABI, arena/pool, source/ring/cache/batches,
+  pressure/admission, events and accounting.
+- src/ddo_vmm_allocator: native bindings, source/tensor ownership and adapters.
+- scripts: explicit build/diagnostic/probe tools, never automatic runtime tuning.
+- tests and native/tests: CPU and explicitly approved hardware contracts.
+Native backing is device memory; driver WDDM pressure behavior is not emulated on
+Linux. Legacy adapters remain compatibility paths and must not be removed.
+Sources retain immutable identity/descriptors and positioned Windows/POSIX reads.
+Keep owners across async I/O; serialize close with calls on the same handle.
+Persistent host storage is native bytes, not loader tensors. Storage commitment,
+registration and GPU residency ceilings remain independent and fixed.
+Unregister preserves cached bytes. Recycling requires last DMA/compute completion.
+Immutable batches/tickets retain source/arena ownership through partial failure.
+Pressure evicts only unpinned/idle backing. Never unmap/free a stream-referenced
+region. Temporary CUDA fallback restores state only after the correct event.
+Failed CUDA completion must retain unsafe ownership, not pretend driver recovery.
+Linux observes overcommit mode/cgroup/process/physical bounds conservatively.
+Canonical cgroup mount identity must not weaken limits. WSL registration observations
+are workload-specific and cannot automatically become defaults or raised ceilings.
+## Builds and delivery
+Use a real compiler and explicitly reviewed CMake features. Build directories must
+be isolated candidates; build helpers have fixed output paths and need inspection.
+Record source revision/dirty state, toolchain, ABI, features, exports and SHA256.
+CMake uses Driver API; optional execution kernels are separate experiments.
+Windows/Linux/WSL are separate artifact/validation identities. Do not retag an
+incompatible ELF as manylinux or upgrade a user's glibc to load our binary.
+No compiler/native download at import or inference. Driver libraries remain
+system prerequisites. Assemble only explicitly selected/hash-verified artifacts.
+Windows and host-Linux hash-selected wheel assembly exist. Installed CUDA and
+older-distro portability remain separate gates; host tags are not manylinux claims.
+Public native adapter dependencies remain optional for ordinary DDO users.
+## Validation and integrations
+Run targeted CPU contracts without CUDA; never count a skip as hardware acceptance.
+Before lifecycle changes reach model benchmarks, require approved small native
+exact-payload/ownership tests. Preserve fallback/multi-block/host-tensor coverage.
+DDO controls fresh-child bootstrap, generic configuration and public metrics.
+Keep host scheduling/residency heuristics out of Python runners. Quantized payload
+transport must retain backend math; optional execution kernels are not compatibility.
+When authorized, commit this repo first and update the DDO gitlink separately.
+## Execution, validation and release authority
+Read this file and relevant public docs before acting. Inspect git status and preserve
+user changes. Use apply_patch for manual edits; scope searches/edits to the task.
+Before CUDA, benchmarks, benchmark parameter changes, compatibility removal or
+history cleanup, show exact command, hypothesis, fixed limits and criteria and
+wait for user approval. CPU tests/builds do not authorize GPU execution.
+Stop at the first failure/anomaly. No silent retries, budget growth, driver resets,
+OS memory-policy changes, binary promotion or full Cartesian test matrix.
+Never claim general support from selected acceptance. Treat missing fields as
+unavailable, not zero; preserve raw result identity and rejected experiments.
+Experimental prereleases precede stable release. Tags, push, Hub/registry upload,
+CI publication and Git-history rewrites require explicit permission.
+Do not remove required licenses/attribution or suggest that hiding names establishes
+independent implementation/license compatibility. Do not commit user scratch files,
+weights, environments, build products, outputs or internal records.

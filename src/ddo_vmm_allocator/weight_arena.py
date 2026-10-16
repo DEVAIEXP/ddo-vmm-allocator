@@ -297,7 +297,13 @@ class VmmWeightArena:
             if entries and all(file_slice is not None for _, file_slice in entries):
                 self._staging_pool.begin_upload()
                 stage_started = time.perf_counter()
-                staged_bytes = self._staging_pool.stage_file_slices(entries)
+                staged = self._staging_pool.stage_file_slices(entries)
+                # Framework staging pools return tensor views, not a byte count.
+                # Keep byte-count transports compatible without changing slot ownership.
+                staged_bytes = (
+                    staged if isinstance(staged, int)
+                    else sum(view.numel() * view.element_size() for view in staged)
+                )
                 self._runtime_stats["file_stage_seconds"] += time.perf_counter() - stage_started
                 expected_bytes = sum(source.numel() * source.element_size() for _, source, _ in group.packed_sources)
                 if staged_bytes != expected_bytes:

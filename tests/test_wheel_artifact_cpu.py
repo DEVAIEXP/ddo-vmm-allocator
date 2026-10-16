@@ -34,6 +34,49 @@ def test_accepts_hash_selected_amd64_dll(tmp_path):
     assert hook.validate_windows_artifact(path, digest.upper()) == digest
 
 
+def elf_bytes(machine=62, elf_type=3, elf_class=2, endian=1):
+    data = bytearray(64)
+    data[:7] = bytes([0x7F, 69, 76, 70, elf_class, endian, 1])
+    struct.pack_into("<HHI", data, 16, elf_type, machine, 1)
+    return bytes(data)
+
+
+def test_accepts_hash_selected_linux_elf(tmp_path):
+    path = tmp_path / "test.so"
+    path.write_bytes(elf_bytes())
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert hook.validate_linux_artifact(path, digest.upper()) == digest
+
+
+@pytest.mark.parametrize("data", [b"invalid", elf_bytes(machine=183), elf_bytes(elf_type=2),
+                                 elf_bytes(elf_class=1), elf_bytes(endian=2)])
+def test_rejects_wrong_elf_architecture_format_or_type(tmp_path, data):
+    path = tmp_path / "test.so"
+    path.write_bytes(data)
+    with pytest.raises(ValueError):
+        hook.validate_linux_artifact(path, hashlib.sha256(data).hexdigest())
+
+
+def test_linux_wheel_has_host_platform_tag_and_manifest(tmp_path, monkeypatch):
+    path = tmp_path / "existing.so"
+    path.write_bytes(elf_bytes())
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setenv("DDO_VMM_WHEEL_LIBRARY", str(path))
+    monkeypatch.setenv("DDO_VMM_WHEEL_SHA256", digest)
+    monkeypatch.delenv("DDO_VMM_WHEEL_ABI_REPORT", raising=False)
+    builder, data = build_hook(tmp_path), {}
+    try:
+        builder.initialize("standard", data)
+        assert data["tag"] == "py3-none-linux_x86_64"
+        assert data["pure_python"] is False
+        sources = {destination: Path(source) for source, destination in data["force_include"].items()}
+        manifest = json.loads(sources["ddo_vmm_allocator/native/linux/artifact.json"].read_text())
+        assert manifest["sha256"] == digest and manifest["platform"] == "linux_x86_64"
+        assert sources["ddo_vmm_allocator/native/linux/libddo_vmm.so"].read_bytes() == elf_bytes()
+    finally:
+        builder.finalize("standard", data, "unused.whl")
+
+
 @pytest.mark.parametrize("data", [b"not a dll", pe_bytes(0x14C), pe_bytes(characteristics=0), b"MZ" + bytes(62)])
 def test_rejects_non_dll_wrong_architecture_and_malformed_headers(tmp_path, data):
     path = tmp_path / "test.dll"

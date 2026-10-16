@@ -6,3 +6,6 @@ build/
 /build-*/
 dist/
 *.egg-info/
+
+# Local handoffs, investigation records and documentation backups.
+/.internal/
