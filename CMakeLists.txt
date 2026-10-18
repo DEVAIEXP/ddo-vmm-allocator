@@ -22,6 +22,14 @@ endif()
 option(DDO_VMM_NATIVE_SOURCE_DISPATCHER "Build the unpromoted asynchronous source dispatcher" OFF)
 option(DDO_VMM_SOURCE_TEST_HOOKS "Enable isolated source lifecycle fault injection (never production)" OFF)
 option(DDO_VMM_ALLOCATION_DIAGNOSTICS "Build opt-in host driver allocation timing (diagnostic only)" OFF)
+option(DDO_VMM_POOL_LIFETIME_TRACE "Build bounded opt-in pool lifetime history (diagnostic only)" OFF)
+option(DDO_VMM_ALLOCATION_FAILURE_TRACE "Log native pool null-return stages (diagnostic only)" OFF)
+if(DDO_VMM_ALLOCATION_FAILURE_TRACE AND NOT DDO_VMM_NATIVE_SPAN_POOL)
+    message(FATAL_ERROR "DDO_VMM_ALLOCATION_FAILURE_TRACE requires DDO_VMM_NATIVE_SPAN_POOL")
+endif()
+if(DDO_VMM_POOL_LIFETIME_TRACE AND NOT DDO_VMM_NATIVE_SPAN_POOL)
+    message(FATAL_ERROR "DDO_VMM_POOL_LIFETIME_TRACE requires DDO_VMM_NATIVE_SPAN_POOL")
+endif()
 
 # NVIDIA's Linux Python toolkit has a versioned runtime library but may lack
 # the unversioned development symlink FindCUDAToolkit expects. This target uses
@@ -44,8 +52,14 @@ add_library(ddo_vmm SHARED
 
 target_compile_features(ddo_vmm PRIVATE cxx_std_20)
 target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_BUILDING_LIBRARY=1)
+if(DDO_VMM_ALLOCATION_FAILURE_TRACE)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_ALLOCATION_FAILURE_TRACE=1)
+endif()
 if(DDO_VMM_ALLOCATION_DIAGNOSTICS)
     target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_ALLOCATION_DIAGNOSTICS=1)
+endif()
+if(DDO_VMM_POOL_LIFETIME_TRACE)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_POOL_LIFETIME_TRACE=1)
 endif()
 target_include_directories(ddo_vmm
     PUBLIC
@@ -77,6 +91,15 @@ else()
 endif()
 
 if(DDO_VMM_BUILD_PROBES)
+    add_executable(ddo_vmm_pool_lifetime_trace_test native/tests/pool_lifetime_trace_test.cpp)
+    add_executable(ddo_vmm_allocation_failure_trace_test native/tests/allocation_failure_trace_test.cpp)
+    target_compile_features(ddo_vmm_allocation_failure_trace_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_allocation_failure_trace_test PRIVATE native/include)
+    target_compile_options(ddo_vmm_allocation_failure_trace_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    target_compile_features(ddo_vmm_pool_lifetime_trace_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_pool_lifetime_trace_test PRIVATE native/include)
     add_executable(ddo_vmm_allocation_diagnostics_test native/tests/allocation_diagnostics_test.cpp)
     target_compile_features(ddo_vmm_allocation_diagnostics_test PRIVATE cxx_std_20)
     target_include_directories(ddo_vmm_allocation_diagnostics_test PRIVATE native/include)
