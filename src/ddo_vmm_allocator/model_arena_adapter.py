@@ -205,6 +205,36 @@ class DeviceTransferBuffer:
         self.capacity_bytes = 0
 
 
+def _upload_execution_bindings(store, bindings, arena):
+    """Upload mixed sources into existing views on one fenced upload stream.
+
+    CPU sources remain owned by their bindings. Only checkpoint-backed bindings
+    enter immutable file batches; no additional registration or staging is added.
+    The enclosing execution buffer owns partial-failure and consumer fences.
+    """
+    host = [binding for binding in bindings if binding.file_slice is None]
+    if not host:
+        return store._native_shard_transport.upload_batch(bindings, arena, store._upload_stream)
+
+    import torch
+
+    for binding in host:
+        if binding.source.device.type != "cpu":
+            raise ModelArenaError("execution buffer host source must be a CPU tensor")
+        if binding.source.dtype != binding.stable.dtype or binding.source.shape != binding.stable.shape:
+            raise ModelArenaError("execution buffer host source must match its destination view")
+    files = [binding for binding in bindings if binding.file_slice is not None]
+    with torch.cuda.stream(store._upload_stream):
+        if files:
+            store._native_shard_transport.upload_batch(files, arena, store._upload_stream)
+        for binding in host:
+            binding.stable.copy_(binding.source, non_blocking=True)
+        # Same-stream ordering covers the file batch and every CPU-source copy.
+        ready = torch.cuda.Event(enable_timing=False)
+        ready.record(store._upload_stream)
+    return ready
+
+
 class NativeExecutionBuffer:
     """Native mapped execution storage, permanently pinned against eviction.
 
@@ -252,9 +282,7 @@ class NativeExecutionBuffer:
         start = time.perf_counter()
         try:
             with torch.cuda.stream(self.store._upload_stream):
-                ready = self.store._native_shard_transport.upload_batch(
-                    copies, self.native, self.store._upload_stream,
-                )
+                ready = _upload_execution_bindings(self.store, copies, self.native)
         except BaseException as error:
             # Also protects partially submitted uploads if the operation fails.
             _run_cleanup_preserving_error(
@@ -346,8 +374,7 @@ class NativeExecutionBuffers:
                 layout = self._layouts[key] = (views, copies)
             views, copies = layout
             start = time.perf_counter()
-            ready = self.store._native_shard_transport.upload_batch(
-                copies, arena, self.store._upload_stream)
+            ready = _upload_execution_bindings(self.store, copies, arena)
             size = sum(binding.nbytes for binding in bindings)
             for metric in ("upload_bytes", "dma_enqueue_bytes", "execution_buffer_bytes"):
                 self.store._runtime_stats[metric] += size
@@ -1654,6 +1681,31 @@ class ModelArenaModuleAdapter:
         self._block_bindings: dict[str, list[_TensorBinding]] = {}
         self._execution_units: list[_ModuleBinding] = []
         self._execution_queue: _ObservedExecutionQueue | None = None
+
+    def cpu_source_intervals(self) -> dict[str, Any]:
+        """Snapshot retained CPU payload ranges without copying or releasing them.
+
+        Caller must own an exclusive pre-execution boundary. Returned integers
+        do not retain tensors and do not establish DMA completion or alias safety.
+        """
+        import torch
+
+        intervals = []
+        for module in self._bindings:
+            for binding in module.tensors:
+                if binding.file_slice is not None:
+                    continue
+                source = binding.source
+                if (type(source) not in (torch.Tensor, torch.nn.Parameter)
+                        or source.device.type != "cpu" or not source.is_contiguous()
+                        or source.layout != torch.strided
+                        or source.numel() * source.element_size() != binding.nbytes):
+                    raise ModelArenaError("CPU source interval observation is unsupported")
+                if binding.nbytes:
+                    intervals.append((source.data_ptr(), binding.nbytes))
+                else:
+                    raise ModelArenaError("Empty CPU source interval is unsupported")
+        return {"schema_version": 1, "binding_count": len(intervals), "intervals": intervals}
 
     def _collect_temporary_lifetimes(self, *, wait: bool = False) -> None:
         pending: list[tuple[Any, list[tuple[_TensorBinding, Any]]]] = []
