@@ -36,6 +36,28 @@ inline bool permits(const Headroom& memory, uint64_t bytes, uint64_t reserve) {
     return bytes <= memory.ram && bytes <= memory.commit
         && reserve <= memory.ram - bytes && reserve <= memory.commit - bytes;
 }
+enum class Admission { allowed, unavailable, insufficient };
+template <typename Observe>
+Admission admission(uint64_t bytes, uint64_t reserve, Observe observe) {
+    Headroom memory{};
+    if (!observe(memory)) return Admission::unavailable;
+    return permits(memory, bytes, reserve) ? Admission::allowed : Admission::insufficient;
+}
+inline Admission admission(uint64_t bytes, uint64_t reserve) {
+    return admission(bytes, reserve, headroom);
+}
+// Capture the platform code before cleanup or another API can overwrite it.
+inline std::string allocation_failure_message(const char* operation) {
+#if defined(_WIN32)
+    const auto code = GetLastError();
+    return std::string(operation) + " failed: Win32 error " + std::to_string(code);
+#elif defined(__linux__)
+    const auto code = errno;
+    return std::string(operation) + " failed: errno " + std::to_string(code);
+#else
+    return std::string(operation) + " failed: platform error unavailable";
+#endif
+}
 inline void* allocate(size_t size) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);

@@ -5,6 +5,8 @@
 #include "host_platform.h"
 #include "ddo_vmm_read_wait.h"
 #include "ddo_vmm_allocation_diagnostics.h"
+#include "ddo_vmm_allocation_attempt.h"
+#include "ddo_vmm_budget_admission.h"
 
 #include <cuda.h>
 
@@ -585,7 +587,7 @@ bool query_windows_memory(int device_ordinal, ddo_vmm_windows_memory_info* out_i
 }
 #endif
 
-bool dxgi_budget_guard_allows_materialize(
+ddo_vmm_detail::BudgetAdmission dxgi_budget_guard_allows_materialize(
     int device_ordinal,
     size_t required_bytes,
     ddo_vmm_backing_kind backing_kind,
@@ -605,19 +607,14 @@ bool dxgi_budget_guard_allows_materialize(
         config.local_reserve_bytes == 0 && config.shared_reserve_bytes == 0
         && config.system_reserve_bytes == 0
     ) {
-        return true;
+        return ddo_vmm_detail::BudgetAdmission::allowed;
     }
 #if defined(_WIN32)
     ddo_vmm_windows_memory_info info{};
     if (!query_windows_memory(device_ordinal, &info)) {
-        return true;
+        return ddo_vmm_detail::BudgetAdmission::unavailable;
     }
-    const auto retained_budget = [](uint64_t budget, uint64_t reserve) {
-        return budget > reserve ? budget - reserve : 0;
-    };
     const uint64_t required = static_cast<uint64_t>(required_bytes);
-    const uint64_t local_limit = retained_budget(info.local_budget_bytes, config.local_reserve_bytes);
-    const uint64_t shared_limit = retained_budget(info.nonlocal_budget_bytes, config.shared_reserve_bytes);
     // DEVICE allocations are intentionally handed to WDDM as device
     // allocations.  The driver may place their physical pages in the
     // non-local/shared segment when local VRAM is exhausted, so the guard must
@@ -628,36 +625,45 @@ bool dxgi_budget_guard_allows_materialize(
     // WDDM. Rejecting it at the local budget would prevent non-local backing.
     // Other VMM regions retain the conservative local-budget guard.
     const bool local_safe = allow_wddm_fallback || info.local_budget_bytes == 0
-        || (info.local_usage_bytes <= local_limit && required <= local_limit - info.local_usage_bytes);
+        || ddo_vmm_detail::budget_room(info.local_budget_bytes, info.local_usage_bytes,
+                                      required, config.local_reserve_bytes);
     const bool shared_safe = backing_kind != DDO_VMM_BACKING_HOST || info.nonlocal_budget_bytes == 0
-        || (info.nonlocal_usage_bytes <= shared_limit && required <= shared_limit - info.nonlocal_usage_bytes);
+        || ddo_vmm_detail::budget_room(info.nonlocal_budget_bytes, info.nonlocal_usage_bytes,
+                                      required, config.shared_reserve_bytes);
     const bool system_safe = config.system_reserve_bytes == 0
-        || (info.available_physical_bytes >= config.system_reserve_bytes + required
-            && info.available_commit_bytes >= config.system_reserve_bytes + required);
-    return local_safe && shared_safe && system_safe;
+        || (ddo_vmm_detail::budget_room(info.available_physical_bytes, 0, required, config.system_reserve_bytes)
+            && ddo_vmm_detail::budget_room(info.available_commit_bytes, 0, required, config.system_reserve_bytes));
+    return local_safe && shared_safe && system_safe
+        ? ddo_vmm_detail::BudgetAdmission::allowed
+        : ddo_vmm_detail::BudgetAdmission::insufficient;
 #else
     (void)device_ordinal;
     (void)required_bytes;
     (void)backing_kind;
     (void)allow_wddm_fallback;
-    return true;
+    return ddo_vmm_detail::BudgetAdmission::allowed;
 #endif
 }
 
-bool make_dxgi_budget_room(
+ddo_vmm_status make_dxgi_budget_room(
     int device_ordinal,
     size_t required_bytes,
     ddo_vmm_backing_kind backing_kind,
     bool allow_wddm_fallback = false
 ) {
-    while (!dxgi_budget_guard_allows_materialize(
-        device_ordinal, required_bytes, backing_kind, allow_wddm_fallback
-    )) {
-        if (!ddo_vmm_pressure_evict_one(device_ordinal)) {
-            return false;
-        }
+    auto decision = ddo_vmm_detail::BudgetAdmission::unavailable;
+    const bool allowed = ddo_vmm_detail::make_budget_room(
+        [&] { decision = dxgi_budget_guard_allows_materialize(
+            device_ordinal, required_bytes, backing_kind, allow_wddm_fallback);
+            return decision; },
+        [&] { return ddo_vmm_pressure_evict_one(device_ordinal); });
+    if (allowed) return DDO_VMM_SUCCESS;
+    if (decision == ddo_vmm_detail::BudgetAdmission::unavailable) {
+        last_error = "configured DXGI budget observation unavailable; materialization refused";
+        return DDO_VMM_CUDA_ERROR;
     }
-    return true;
+    last_error = "configured DXGI budget headroom insufficient; materialization refused";
+    return DDO_VMM_OUT_OF_MEMORY;
 }
 
 bool dxgi_budget_guard_configured(int device_ordinal) {
@@ -890,22 +896,23 @@ ddo_vmm_status materialize_region_range(
     const bool guard_configured = dxgi_budget_guard_configured(region->device_ordinal);
     std::vector<ddo_vmm_region::Mapping> added_mappings;
     for (const auto& [range_offset, range_size] : missing_ranges) {
-        if (!make_dxgi_budget_room(region->device_ordinal, range_size, region->backing_kind)) {
-            set_error("dxgi_budget_guard", CUDA_ERROR_OUT_OF_MEMORY);
-            return DDO_VMM_OUT_OF_MEMORY;
+        const auto guard_status = make_dxgi_budget_room(region->device_ordinal, range_size, region->backing_kind);
+        if (guard_status != DDO_VMM_SUCCESS) {
+            return guard_status;
         }
 
         CUmemGenericAllocationHandle allocation = 0;
-        while (cuMemCreate(&allocation, range_size, &properties, 0) != CUDA_SUCCESS) {
-            allocation = 0;
-            if (guard_configured) {
-                set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
-                return DDO_VMM_OUT_OF_MEMORY;
-            }
-            if (!ddo_vmm_pressure_evict_one(region->device_ordinal)) {
-                set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
-                return DDO_VMM_OUT_OF_MEMORY;
-            }
+        const auto create_result = ddo_vmm_detail::allocation_attempt(
+            [&] {
+                allocation = 0;
+                return cuMemCreate(&allocation, range_size, &properties, 0);
+            },
+            [&] { return ddo_vmm_pressure_evict_one(region->device_ordinal); },
+            CUDA_ERROR_OUT_OF_MEMORY, !guard_configured);
+        if (create_result != CUDA_SUCCESS) {
+            set_error("cuMemCreate", create_result);
+            return create_result == CUDA_ERROR_OUT_OF_MEMORY
+                ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
         }
         if (allocation == 0) {
             return DDO_VMM_OUT_OF_MEMORY;
@@ -998,13 +1005,15 @@ extern "C" ddo_vmm_status ddo_vmm_region_create_ex(
         }
         return DDO_VMM_CUDA_ERROR;
     }
-    if (!checked(cuMemCreate(&region->allocation, mapped_size, &properties, 0), "cuMemCreate")) {
+    const auto create_result = cuMemCreate(&region->allocation, mapped_size, &properties, 0);
+    if (!checked(create_result, "cuMemCreate")) {
         cuMemAddressFree(region->address, region->mapped_size);
         if (region->retained_primary_context != nullptr) {
             cuCtxSetCurrent(nullptr);
             cuDevicePrimaryCtxRelease(device_ordinal);
         }
-        return DDO_VMM_OUT_OF_MEMORY;
+        return create_result == CUDA_ERROR_OUT_OF_MEMORY
+            ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
     }
     if (!checked(cuMemMap(region->address, mapped_size, 0, region->allocation, 0), "cuMemMap")) {
         cuMemRelease(region->allocation);
@@ -1126,23 +1135,23 @@ extern "C" ddo_vmm_status ddo_vmm_region_materialize(ddo_vmm_region* region) {
     }
     CUmemGenericAllocationHandle allocation = 0;
     const bool guard_configured = dxgi_budget_guard_configured(region->device_ordinal);
-    if (!make_dxgi_budget_room(region->device_ordinal, region->mapped_size, region->backing_kind)) {
-        set_error("dxgi_budget_guard", CUDA_ERROR_OUT_OF_MEMORY);
+    const auto guard_status = make_dxgi_budget_room(region->device_ordinal, region->mapped_size, region->backing_kind);
+    if (guard_status != DDO_VMM_SUCCESS) {
         release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
-        return DDO_VMM_OUT_OF_MEMORY;
+        return guard_status;
     }
-    while (cuMemCreate(&allocation, region->mapped_size, &properties, 0) != CUDA_SUCCESS) {
-        allocation = 0;
-        if (guard_configured) {
-            set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
-            release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
-            return DDO_VMM_OUT_OF_MEMORY;
-        }
-        if (!ddo_vmm_pressure_evict_one(region->device_ordinal)) {
-            set_error("cuMemCreate", CUDA_ERROR_OUT_OF_MEMORY);
-            release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
-            return DDO_VMM_OUT_OF_MEMORY;
-        }
+    const auto create_result = ddo_vmm_detail::allocation_attempt(
+        [&] {
+            allocation = 0;
+            return cuMemCreate(&allocation, region->mapped_size, &properties, 0);
+        },
+        [&] { return ddo_vmm_pressure_evict_one(region->device_ordinal); },
+        CUDA_ERROR_OUT_OF_MEMORY, !guard_configured);
+    if (create_result != CUDA_SUCCESS) {
+        set_error("cuMemCreate", create_result);
+        release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
+        return create_result == CUDA_ERROR_OUT_OF_MEMORY
+            ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
     }
     if (allocation == 0) {
         release_temporary_primary_context(region->device_ordinal, temporary_primary_context);
@@ -1579,20 +1588,31 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
                 return DDO_VMM_OUT_OF_MEMORY;
             }
         }
-        if (!make_dxgi_budget_room(
+        const auto guard_status = make_dxgi_budget_room(
             arena->device_ordinal, arena->page_size, arena->backing_kind, true
-        )) {
-            model_arena_limit_admission(arena, page_index, "memory guard");
-            last_error = "model arena admission boundary reached by memory guard";
+        );
+        if (guard_status != DDO_VMM_SUCCESS) {
+            if (guard_status == DDO_VMM_OUT_OF_MEMORY) {
+                model_arena_limit_admission(arena, page_index, "memory guard");
+                last_error = "model arena admission boundary reached by memory guard";
+            }
             release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
-            return DDO_VMM_OUT_OF_MEMORY;
+            return guard_status;
         }
         CUmemGenericAllocationHandle allocation = 0;
-        if (cuMemCreate(&allocation, arena->page_size, &properties, 0) != CUDA_SUCCESS) {
-            model_arena_limit_admission(arena, page_index, "CUDA allocation pressure");
-            last_error = "model arena admission boundary reached by CUDA allocation pressure";
+        const auto create_result = cuMemCreate(&allocation, arena->page_size, &properties, 0);
+        if (create_result != CUDA_SUCCESS) {
+            if (create_result == CUDA_ERROR_OUT_OF_MEMORY) {
+                model_arena_limit_admission(arena, page_index, "CUDA allocation pressure");
+            }
+            set_error("cuMemCreate", create_result);
+            if (create_result == CUDA_ERROR_OUT_OF_MEMORY) {
+                last_error = "model arena admission boundary reached by CUDA allocation pressure: "
+                    + last_error;
+            }
             release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
-            return DDO_VMM_OUT_OF_MEMORY;
+            return create_result == CUDA_ERROR_OUT_OF_MEMORY
+                ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
         }
         const CUdeviceptr page_address = arena->address + page_index * arena->page_size;
         if (!checked(cuMemMap(page_address, arena->page_size, 0, allocation, 0), "cuMemMap")) {
@@ -2226,23 +2246,17 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_create(
             last_error = "host ring would exceed the active source-cache process limit";
             return DDO_VMM_OUT_OF_MEMORY;
         }
-        ddo_host_platform::Headroom memory{};
-        const uint64_t headroom = ddo_host_accounting::active_cache_headroom_bytes;
-        if (!ddo_host_platform::headroom(memory)
-            || !ddo_host_platform::permits(memory, requested_bytes, headroom)) {
-            last_error = "host ring registration would breach source-cache RAM/commit headroom";
-            return DDO_VMM_OUT_OF_MEMORY;
-        }
     }
-#if defined(__linux__)
-    else {
-        // Ring-only transport must not bypass Linux process/container limits.
-        ddo_host_platform::Headroom memory{};
-        if (!ddo_host_platform::headroom(memory)
-            || !ddo_host_platform::permits(memory, requested_bytes, 0)) {
-            last_error = "host ring Linux host/cgroup headroom unavailable or insufficient";
-            return DDO_VMM_OUT_OF_MEMORY;
-        }
+#if defined(_WIN32) || defined(__linux__)
+    // Ring-only transport observes host limits even without a configured cache.
+    const uint64_t headroom = cache_limit == std::numeric_limits<uint64_t>::max()
+        ? 0 : ddo_host_accounting::active_cache_headroom_bytes;
+    const auto admission = ddo_host_platform::admission(requested_bytes, headroom);
+    if (admission != ddo_host_platform::Admission::allowed) {
+        last_error = admission == ddo_host_platform::Admission::unavailable
+            ? "host ring RAM/commit observation unavailable; allocation refused"
+            : "host ring RAM/commit headroom insufficient for staging and configured reserve";
+        return DDO_VMM_OUT_OF_MEMORY;
     }
 #endif
     CUcontext retained_primary_context = nullptr;
@@ -2255,17 +2269,36 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_create(
     ring->slots.reserve(slot_count);
     for (size_t index = 0; index < slot_count; ++index) {
         ddo_vmm_host_ring::Slot slot{};
+        auto slot_status = DDO_VMM_SUCCESS;
 #if defined(_WIN32) || defined(__linux__)
         slot.address = ddo_host_platform::allocate(slot_size_bytes);
-        if (slot.address != nullptr
-            && checked(cuMemHostRegister(slot.address, slot_size_bytes, CU_MEMHOSTREGISTER_PORTABLE), "cuMemHostRegister")) {
-            slot.virtual_memory_registered = true;
+        if (slot.address == nullptr) {
+            last_error = ddo_host_platform::allocation_failure_message("host ring storage allocation");
+            slot_status = DDO_VMM_OUT_OF_MEMORY;
+        } else {
+            const auto registration = cuMemHostRegister(slot.address, slot_size_bytes, CU_MEMHOSTREGISTER_PORTABLE);
+            if (checked(registration, "cuMemHostRegister")) {
+                slot.virtual_memory_registered = true;
+            } else {
+                slot_status = registration == CUDA_ERROR_OUT_OF_MEMORY
+                    ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
+            }
         }
-        if (!slot.virtual_memory_registered ||
 #else
-        if (!checked(cuMemHostAlloc(&slot.address, slot_size_bytes, CU_MEMHOSTALLOC_PORTABLE), "cuMemHostAlloc") ||
+        const auto allocation = cuMemHostAlloc(&slot.address, slot_size_bytes, CU_MEMHOSTALLOC_PORTABLE);
+        if (!checked(allocation, "cuMemHostAlloc")) {
+            slot_status = allocation == CUDA_ERROR_OUT_OF_MEMORY
+                ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
+        }
 #endif
-            !checked(cuEventCreate(&slot.completion, CU_EVENT_DISABLE_TIMING), "cuEventCreate(host ring)")) {
+        if (slot_status == DDO_VMM_SUCCESS) {
+            const auto event = cuEventCreate(&slot.completion, CU_EVENT_DISABLE_TIMING);
+            if (!checked(event, "cuEventCreate(host ring)")) {
+                slot_status = event == CUDA_ERROR_OUT_OF_MEMORY
+                    ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
+            }
+        }
+        if (slot_status != DDO_VMM_SUCCESS) {
             if (slot.completion != nullptr) {
                 cuEventDestroy(slot.completion);
             }
@@ -2289,7 +2322,7 @@ extern "C" ddo_vmm_status ddo_vmm_host_ring_create(
 #endif
             }
             release_temporary_primary_context(device_ordinal, retained_primary_context);
-            return DDO_VMM_CUDA_ERROR;
+            return slot_status;
         }
         ring->slots.push_back(std::move(slot));
     }
@@ -2394,8 +2427,8 @@ ddo_vmm_status ddo_source_io::commit_storage(ddo_vmm_host_ring* ring, size_t ind
         return DDO_VMM_CUDA_ERROR;
     void* address = ddo_host_platform::allocate(ring->slot_size);
     if (!address) {
+        last_error = ddo_host_platform::allocation_failure_message("progressive host slot commit");
         cuEventDestroy(event);
-        last_error = "progressive host slot commit failed";
         return DDO_VMM_OUT_OF_MEMORY;
     }
     slot.address = address;
@@ -2671,11 +2704,11 @@ extern "C" ddo_vmm_status ddo_vmm_pressure_prepare_cuda_allocation(
     // With no configured WDDM reserve this is deliberately a no-op. The
     // allocation path still has its OOM retry below, avoiding speculative
     // eviction during ordinary steady-state work.
-    if (!make_dxgi_budget_room(
+    const auto guard_status = make_dxgi_budget_room(
         device_ordinal, required_bytes, DDO_VMM_BACKING_DEVICE, false
-    )) {
-        last_error = "native VMM could not restore CUDA allocation headroom";
-        return DDO_VMM_OUT_OF_MEMORY;
+    );
+    if (guard_status != DDO_VMM_SUCCESS) {
+        return guard_status;
     }
     return DDO_VMM_SUCCESS;
 }

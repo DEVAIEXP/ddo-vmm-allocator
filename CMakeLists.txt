@@ -91,6 +91,24 @@ else()
 endif()
 
 if(DDO_VMM_BUILD_PROBES)
+    add_executable(ddo_vmm_budget_admission_test native/tests/budget_admission_test.cpp)
+    target_compile_features(ddo_vmm_budget_admission_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_budget_admission_test PRIVATE native/include)
+    target_compile_options(ddo_vmm_budget_admission_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    add_executable(ddo_vmm_host_admission_test native/tests/host_admission_test.cpp)
+    target_compile_features(ddo_vmm_host_admission_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_host_admission_test PRIVATE native/src)
+    target_compile_options(ddo_vmm_host_admission_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    add_executable(ddo_vmm_allocation_attempt_test native/tests/allocation_attempt_test.cpp)
+    target_compile_features(ddo_vmm_allocation_attempt_test PRIVATE cxx_std_20)
+    target_include_directories(ddo_vmm_allocation_attempt_test PRIVATE native/include)
+    target_compile_options(ddo_vmm_allocation_attempt_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
     add_executable(ddo_vmm_pool_lifetime_trace_test native/tests/pool_lifetime_trace_test.cpp)
     add_executable(ddo_vmm_allocation_failure_trace_test native/tests/allocation_failure_trace_test.cpp)
     target_compile_features(ddo_vmm_allocation_failure_trace_test PRIVATE cxx_std_20)

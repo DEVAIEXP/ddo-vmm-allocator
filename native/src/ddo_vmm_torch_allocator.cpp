@@ -9,6 +9,7 @@
 #include "ddo_vmm_stream_dependency.h"
 #include "ddo_vmm_allocation_footprint.h"
 #include "ddo_vmm_cache_selection.h"
+#include "ddo_vmm_allocation_attempt.h"
 #ifdef DDO_VMM_NATIVE_SPAN_POOL
 #include "ddo_vmm_torch_pool.h"
 #endif
@@ -274,24 +275,18 @@ extern "C" DDO_VMM_API void* ddo_vmm_torch_malloc(
             }
         }
         ddo_vmm_region* raw_region = nullptr;
-        if (ddo_vmm_region_create(device_ordinal, requested_size, &raw_region) != DDO_VMM_SUCCESS) {
+        auto creation = ddo_vmm_region_create(device_ordinal, requested_size, &raw_region);
+        if (creation != DDO_VMM_SUCCESS) {
+            if (creation != DDO_VMM_OUT_OF_MEMORY) return nullptr;
             // A full cache must never make a new allocation fail.  Release
             // cached physical backing and retry once before reporting OOM.
             auto evicted = drain_cached_allocations();
             release_records(evicted);
-            if (ddo_vmm_region_create(device_ordinal, requested_size, &raw_region) != DDO_VMM_SUCCESS) {
-                // Model-weight mappings retain stable virtual ranges. Reclaim
-                // one eligible native mapping at a time and retry until no
-                // safe page or region remains.
-                while (ddo_vmm_pressure_evict_one(device_ordinal)) {
-                    if (ddo_vmm_region_create(device_ordinal, requested_size, &raw_region) == DDO_VMM_SUCCESS) {
-                        break;
-                    }
-                }
-                if (raw_region == nullptr) {
-                    return nullptr;
-                }
-            }
+            creation = ddo_vmm_detail::allocation_attempt(
+                [&] { return ddo_vmm_region_create(device_ordinal, requested_size, &raw_region); },
+                [&] { return ddo_vmm_pressure_evict_one(device_ordinal); },
+                DDO_VMM_OUT_OF_MEMORY, true);
+            if (creation != DDO_VMM_SUCCESS) return nullptr;
         }
         record.region = std::unique_ptr<ddo_vmm_region, decltype(&ddo_vmm_region_destroy)>(
             raw_region, &ddo_vmm_region_destroy

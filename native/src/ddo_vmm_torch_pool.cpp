@@ -4,6 +4,7 @@
 #include "ddo_vmm_stream_dependency.h"
 #include "ddo_vmm_allocation_diagnostics.h"
 #include "ddo_vmm_allocation_failure_trace.h"
+#include "ddo_vmm_allocation_attempt.h"
 #include <cstdio>
 #ifdef DDO_VMM_POOL_LIFETIME_TRACE
 #include "ddo_vmm_pool_lifetime_trace.h"
@@ -355,6 +356,8 @@ void* ddo_vmm_pool_malloc(size_t bytes, int device, cudaStream_t stream) noexcep
         attempt.stage("region_create");
         const auto creation = ddo_vmm_region_create(device, normalized, &raw);
         if (creation != DDO_VMM_SUCCESS) {
+            attempt.region_failure(creation, ddo_vmm_last_error());
+            if (creation != DDO_VMM_OUT_OF_MEMORY) return nullptr;
 #ifdef DDO_VMM_POOL_LIFETIME_TRACE
             {
                 std::scoped_lock lock(pool_mutex);
@@ -362,11 +365,17 @@ void* ddo_vmm_pool_malloc(size_t bytes, int device, cudaStream_t stream) noexcep
             }
 #endif
             while (evict_one(false, 2, mapped)) {}
-            ddo_vmm_status retry_creation;
-            while ((retry_creation = ddo_vmm_region_create(device, normalized, &raw)) != DDO_VMM_SUCCESS) {
-                attempt.region_failure(retry_creation, ddo_vmm_last_error());
-                if (!ddo_vmm_pressure_evict_one(device)) return nullptr;
-            }
+            const auto retry_creation = allocation_attempt(
+                [&] {
+                    const auto result = ddo_vmm_region_create(device, normalized, &raw);
+                    if (result != DDO_VMM_SUCCESS) {
+                        attempt.region_failure(result, ddo_vmm_last_error());
+                    }
+                    return result;
+                },
+                [&] { return ddo_vmm_pressure_evict_one(device); },
+                DDO_VMM_OUT_OF_MEMORY, true);
+            if (retry_creation != DDO_VMM_SUCCESS) return nullptr;
         }
         RegionOwner region(raw, &ddo_vmm_region_destroy);
         std::scoped_lock lock(pool_mutex);
