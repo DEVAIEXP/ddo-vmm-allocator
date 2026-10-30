@@ -1,4 +1,23 @@
 # Native package delivery
+
+## GitHub release drafts
+
+After an accepted version is published on PyPI, run **Actions → Prepare reviewed
+PyPI release draft** from `main`, supplying the version and full allocator source
+SHA used to build those wheels. The workflow uses DDO's shared draft tooling and
+the allocator repository's scoped `GITHUB_TOKEN`; it needs no PyPI credential.
+It verifies the existing PyPI wheel hashes and metadata, generates categorized
+notes, and attaches the unchanged wheels, checksums and manifest to a draft.
+It does not build binaries, execute CUDA, publish the draft or move existing tags.
+
+Review source identity and platform acceptance before publishing the draft in
+GitHub Releases. That explicit publication creates `v<version>` at the selected
+allocator commit. Publish DDO's corresponding draft separately using its own
+build revision and matching allocator gitlink. Existing drafts/tags are refused;
+inspect partial drafts after failures rather than rerunning blindly.
+See the [shared release procedure](https://devaiexp.github.io/diffusers-dynamic-offloader/docs/developer/releases/#github-release-drafts).
+
+## Candidate assembly
 Experimental prereleases are planned before stable distribution. Do not advertise
 an unuploaded package or claim arbitrary-model/platform compatibility.
 Current Hatch build hook assembles an existing Windows AMD64 DLL only when

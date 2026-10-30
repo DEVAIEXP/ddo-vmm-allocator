@@ -1,0 +1,23 @@
+name: Prepare reviewed PyPI release draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published allocator prerelease version (for example 0.1.0rc4)
+        required: true
+        type: string
+      source_commit:
+        description: Full allocator source SHA used for the validated published wheels
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    uses: DEVAIEXP/diffusers-dynamic-offloader/.github/workflows/release-draft.yml@main
+    with:
+      version: ${{ inputs.version }}
+      source_commit: ${{ inputs.source_commit }}
