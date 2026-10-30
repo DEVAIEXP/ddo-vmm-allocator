@@ -15,6 +15,10 @@ cmake --build build-linux-candidate --parallel 2
 ```
 Windows uses the reviewed MSVC/CMake configuration; selected joined-span artifacts
 have different features, so do not assume this Linux recipe reproduces them.
+`DDO_VMM_MAPPING_TRACE=ON` is a Windows-only opt-in diagnostic build feature.
+It does not enable recording automatically; use a separate candidate directory.
+Its internal ABI is not a supported Python residency-control interface.
+
 Build helpers have fixed paths: inspect before running. Record source revision/
 dirty state, features, compiler/toolkit, architecture, exports, dependencies and hash.
 Do not bundle host NVIDIA drivers. WSL cannot necessarily load a newer native-Linux

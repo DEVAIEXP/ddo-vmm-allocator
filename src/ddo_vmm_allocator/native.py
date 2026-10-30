@@ -925,6 +925,43 @@ class NativeExecutionPool:
     def resident_bytes(self):
         return sum(arena.info.resident_size for arena in self._arenas.values())
 
+    def configure_reclaim(self, *, enabled: bool, margin_bytes: int = 256 * 2**20):
+        if not isinstance(enabled, bool) or not isinstance(margin_bytes, int) or not 0 <= margin_bytes < 2**64:
+            raise ValueError("reclaim requires a boolean enablement and a uint64 margin")
+        fn = getattr(self._owner._library, "ddo_vmm_execution_pool_configure_reclaim", None)
+        if fn is None:
+            raise NativeVmmError("execution backing reclaim requires a compatible allocator build")
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
+        fn.restype = ctypes.c_int
+        self._check(fn(self._handle, int(enabled), margin_bytes))
+
+    def reclaim_idle(self, index: int) -> int:
+        """Explicit native reclaim; live or pending consumers refuse without waiting."""
+        if not isinstance(index, int) or not 0 <= index < self.slots:
+            raise ValueError("execution slot index is out of range")
+        fn = getattr(self._owner._library, "ddo_vmm_execution_pool_reclaim_idle", None)
+        if fn is None:
+            raise NativeVmmError("execution backing reclaim requires a compatible allocator build")
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64)]
+        fn.restype = ctypes.c_int
+        released = ctypes.c_uint64()
+        self._check(fn(self._handle, index, ctypes.byref(released)))
+        return released.value
+
+    def reclaim_stats(self) -> dict[str, int]:
+        fn = getattr(self._owner._library, "ddo_vmm_execution_pool_reclaim_stats", None)
+        if fn is None:
+            return {}  # Older artifacts do not report this optional feature.
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        fn.restype = ctypes.c_int
+        values = (ctypes.c_uint64 * 16)()
+        self._check(fn(self._handle, values, len(values)))
+        if values[0] != 1 or values[1] != len(values):
+            raise NativeVmmError("unsupported execution backing stats schema")
+        names = ("enabled", "margin_bytes", "queries", "triggers", "busy", "reclaims",
+                 "released_bytes", "recreations", "recreated_bytes", "unavailable", "failures")
+        return dict(zip(names, values[2:13]))
+
     def close(self):
         self._check(self._owner._library.ddo_vmm_execution_pool_close(ctypes.byref(self._handle)))
         for arena in self._arenas.values():

@@ -7,6 +7,7 @@
 #include "ddo_vmm_allocation_diagnostics.h"
 #include "ddo_vmm_allocation_attempt.h"
 #include "ddo_vmm_budget_admission.h"
+#include "ddo_vmm_execution_recheck.h"
 
 #include <cuda.h>
 
@@ -34,16 +35,33 @@
 #include <dxgi1_4.h>
 #endif
 
+#ifdef DDO_VMM_MAPPING_TRACE
+CUresult ddo_trace_mem_map(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
+CUresult ddo_trace_mem_unmap(CUdeviceptr, size_t);
+CUresult ddo_trace_mem_release(CUmemGenericAllocationHandle);
+#define DDO_MEM_MAP(...) ddo_trace_mem_map(__VA_ARGS__)
+#define DDO_MEM_UNMAP(...) ddo_trace_mem_unmap(__VA_ARGS__)
+#define DDO_MEM_RELEASE(...) ddo_trace_mem_release(__VA_ARGS__)
+#else
+#define DDO_MEM_MAP(...) ::cuMemMap(__VA_ARGS__)
+#define DDO_MEM_UNMAP(...) ::cuMemUnmap(__VA_ARGS__)
+#define DDO_MEM_RELEASE(...) ::cuMemRelease(__VA_ARGS__)
+#endif
+
 #ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
 namespace ddo_vmm_detail { AllocationDiagnostics allocation_diagnostics; }
 // Wrap only this native implementation's calls; disabled builds call the driver directly.
 #define cuMemCreate(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::create, [&] { return ::cuMemCreate(__VA_ARGS__); })
-#define cuMemMap(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::map, [&] { return ::cuMemMap(__VA_ARGS__); })
+#define cuMemMap(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::map, [&] { return DDO_MEM_MAP(__VA_ARGS__); })
 #define cuMemSetAccess(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::access, [&] { const auto result = ::cuMemSetAccess(__VA_ARGS__); ddo_vmm_detail::allocation_diagnostics.access_result(result, CUDA_ERROR_NOT_READY, CUDA_ERROR_OUT_OF_MEMORY); return result; })
-#define cuMemUnmap(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::unmap, [&] { return ::cuMemUnmap(__VA_ARGS__); })
-#define cuMemRelease(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::release, [&] { return ::cuMemRelease(__VA_ARGS__); })
+#define cuMemUnmap(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::unmap, [&] { return DDO_MEM_UNMAP(__VA_ARGS__); })
+#define cuMemRelease(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::release, [&] { return DDO_MEM_RELEASE(__VA_ARGS__); })
 #define cuMemAddressReserve(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::reserve, [&] { return ::cuMemAddressReserve(__VA_ARGS__); })
 #define cuMemAddressFree(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::address_free, [&] { return ::cuMemAddressFree(__VA_ARGS__); })
+#elif defined(DDO_VMM_MAPPING_TRACE)
+#define cuMemMap(...) DDO_MEM_MAP(__VA_ARGS__)
+#define cuMemUnmap(...) DDO_MEM_UNMAP(__VA_ARGS__)
+#define cuMemRelease(...) DDO_MEM_RELEASE(__VA_ARGS__)
 #endif
 
 extern "C" int ddo_vmm_allocation_diagnostics_enable_v1(int enabled) {
@@ -287,19 +305,32 @@ struct ddo_vmm_model_arena {
     std::vector<Page> pages;
 };
 
+#include "ddo_vmm_execution_registry.h"
 struct ddo_vmm_execution_pool {
     struct Slot {
         ddo_vmm_model_arena* arena = nullptr;
         bool leased = false;
         bool materialized = false;
+        bool reclaim_poisoned = false;
+        bool backing_reclaimed = false;
     };
     std::mutex mutex;
     std::vector<Slot> slots;
     size_t next = 0;
+    bool reclaim_enabled = false;
+    execution_reclaim::ProbeCadence reclaim_cadence;
+    uint64_t reclaim_margin = 0;
+    uint64_t reclaim_queries = 0, reclaim_triggers = 0, reclaim_busy = 0;
+    uint64_t reclaims = 0, reclaimed_bytes = 0, recreations = 0, recreated_bytes = 0;
+    uint64_t reclaim_unavailable = 0, reclaim_failures = 0;
     ~ddo_vmm_execution_pool() {
         for (auto& slot : slots) ddo_vmm_model_arena_destroy(slot.arena);
     }
 };
+
+static execution_pressure::Registry<ddo_vmm_execution_pool> execution_pressure_registry;
+static std::atomic<size_t> execution_reclaim_enabled_pools{0};
+static int execution_backing_pressure_prepare(int device, size_t required, bool reuse = false);
 
 struct ddo_vmm_host_ring {
     int device_ordinal = -1;
@@ -2701,6 +2732,9 @@ extern "C" ddo_vmm_status ddo_vmm_pressure_prepare_cuda_allocation(
         last_error = "CUDA allocation pressure arguments are invalid";
         return DDO_VMM_INVALID_ARGUMENT;
     }
+    const auto execution_status = execution_backing_pressure_prepare(device_ordinal, required_bytes);
+    if (execution_status != DDO_VMM_SUCCESS)
+        return static_cast<ddo_vmm_status>(execution_status);
     // With no configured WDDM reserve this is deliberately a no-op. The
     // allocation path still has its OOM retry below, avoiding speculative
     // eviction during ordinary steady-state work.
@@ -2843,6 +2877,7 @@ extern "C" int ddo_vmm_execution_pool_create(ddo_vmm_model_arena* model,
         if (status != DDO_VMM_SUCCESS) {
             return status;
         }
+        execution_pressure_registry.add(pool.get());
         *output = pool.release();
         return DDO_VMM_SUCCESS;
     } catch (...) {
@@ -2859,6 +2894,10 @@ extern "C" int ddo_vmm_execution_pool_acquire(ddo_vmm_execution_pool* pool,
     for (size_t step = 0; step < pool->slots.size(); ++step) {
         const size_t candidate = (pool->next + step) % pool->slots.size();
         auto& slot = pool->slots[candidate];
+        if (slot.reclaim_poisoned) {
+            last_error = "execution slot retained after unsafe reclaim failure";
+            return DDO_VMM_CUDA_ERROR;
+        }
         if (slot.leased) continue;
         auto status = ddo_vmm_model_arena_wait_compute(slot.arena, upload_stream);
         if (status != DDO_VMM_SUCCESS) return status;
@@ -2867,7 +2906,12 @@ extern "C" int ddo_vmm_execution_pool_acquire(ddo_vmm_execution_pool* pool,
             status = ddo_vmm_model_arena_fault_range(slot.arena, 0,
                 slot.arena->virtual_size, &signature);
             if (status != DDO_VMM_SUCCESS) return status;
-            slot.materialized = true; // Permanently pin; only close releases.
+            slot.materialized = true; // Pinned until checked idle reclaim or close.
+            if (slot.backing_reclaimed) {
+                ++pool->recreations;
+                pool->recreated_bytes += slot.arena->virtual_size;
+                slot.backing_reclaimed = false;
+            }
         }
         slot.leased = true;
         pool->next = (candidate + 1) % pool->slots.size();
@@ -2894,9 +2938,12 @@ extern "C" int ddo_vmm_execution_pool_close(ddo_vmm_execution_pool** owner) {
     if (!owner) return DDO_VMM_INVALID_ARGUMENT;
     auto* pool = *owner;
     if (!pool) return DDO_VMM_SUCCESS;
-    {
+    int close_status = DDO_VMM_INVALID_ARGUMENT;
+    const auto registry_status = execution_pressure_registry.close(pool, [&]() {
+      close_status = [&]() -> int {
         std::scoped_lock lock(pool->mutex);
         for (const auto& slot : pool->slots) {
+            if (slot.reclaim_poisoned) return DDO_VMM_CUDA_ERROR;
             if (slot.leased) {
                 last_error = "execution pool still has live slot leases";
                 return DDO_VMM_BUSY;
@@ -2908,10 +2955,171 @@ extern "C" int ddo_vmm_execution_pool_close(ddo_vmm_execution_pool** owner) {
             ddo_vmm_model_arena_destroy(slot.arena);
             slot.arena = nullptr;
         }
-    }
+        return DDO_VMM_SUCCESS;
+      }();
+      if (close_status == DDO_VMM_SUCCESS) return execution_reclaim::Result::success;
+      if (close_status == DDO_VMM_BUSY) return execution_reclaim::Result::busy;
+      return execution_reclaim::Result::failed;
+    });
+    if (registry_status != execution_reclaim::Result::success) return close_status;
+    if (pool->reclaim_enabled) --execution_reclaim_enabled_pools;
     delete pool;
     *owner = nullptr;
     return DDO_VMM_SUCCESS;
+}
+
+// The caller owns the pool lock. Allocation callbacks also try-lock the arena.
+static int execution_slot_reclaim_locked(ddo_vmm_execution_pool* pool,
+    size_t index, uint64_t* released_bytes, bool nonblocking) {
+    auto& slot = pool->slots[index];
+    auto* arena = slot.arena;
+    std::unique_lock<std::mutex> arena_lock(arena->mutation_mutex, std::defer_lock);
+    if (nonblocking) {
+        if (!arena_lock.try_lock()) return DDO_VMM_BUSY;
+    } else arena_lock.lock();
+    CUcontext temporary = nullptr;
+    using execution_reclaim::Result;
+    const auto result = execution_reclaim::run(slot.leased, slot.reclaim_poisoned,
+        slot.materialized, arena->pages.size(), [&]() {
+            if (!arena->compute_fence_recorded
+                || !activate_model_arena_context(arena, &temporary)) return Result::failed;
+            const auto completion = cuEventQuery(arena->compute_fence);
+            if (completion == CUDA_ERROR_NOT_READY) return Result::busy;
+            if (completion != CUDA_SUCCESS) {
+                checked(completion, "execution reclaim completion query");
+                return Result::failed;
+            }
+            return Result::success;
+        }, [&](size_t page_index) {
+            auto& page = arena->pages[page_index];
+            if (!page.allocation || page.pin_count != 1 || page.view_bootstrap_mapped) return false;
+            if (!checked(cuMemUnmap(arena->address + page_index * arena->page_size,
+                arena->page_size), "execution reclaim unmap")) return false;
+            // On release failure the handle remains recorded. The poisoned slot
+            // cannot be acquired or destroyed, avoiding a second unmap/free.
+            if (!checked(cuMemRelease(page.allocation), "execution reclaim release")) return false;
+            page.allocation = 0;
+            page.pin_count = 0;
+            --arena->resident_pages;
+            ++arena->evicted_pages;
+            *released_bytes += arena->page_size;
+            return true;
+        });
+    release_temporary_primary_context(arena->device_ordinal, temporary);
+    if (*released_bytes) {
+        slot.backing_reclaimed = true;
+        ++pool->reclaims;
+        pool->reclaimed_bytes += *released_bytes;
+    }
+    if (result == Result::busy) return DDO_VMM_BUSY;
+    if (result == Result::failed) return DDO_VMM_CUDA_ERROR;
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" DDO_VMM_API int ddo_vmm_execution_pool_reclaim_idle(
+    ddo_vmm_execution_pool* pool, size_t index, uint64_t* released_bytes) {
+    if (!pool || !released_bytes || index >= pool->slots.size()) return DDO_VMM_INVALID_ARGUMENT;
+    *released_bytes = 0;
+    std::scoped_lock pool_lock(pool->mutex);
+    return execution_slot_reclaim_locked(pool, index, released_bytes, false);
+}
+
+extern "C" int ddo_vmm_execution_pool_configure_reclaim(
+    ddo_vmm_execution_pool* pool, int enabled, uint64_t margin_bytes) {
+    if (!pool || (enabled != 0 && enabled != 1)) return DDO_VMM_INVALID_ARGUMENT;
+#if !defined(_WIN32)
+    if (enabled) {
+        last_error = "automatic execution backing reclaim requires Windows DXGI";
+        return DDO_VMM_INVALID_ARGUMENT;
+    }
+#endif
+    std::scoped_lock lock(pool->mutex);
+    for (const auto& slot : pool->slots) {
+        if (slot.leased || slot.reclaim_poisoned) return DDO_VMM_BUSY;
+    }
+    if (pool->reclaim_enabled != (enabled != 0)) {
+        if (enabled) ++execution_reclaim_enabled_pools;
+        else --execution_reclaim_enabled_pools;
+    }
+    pool->reclaim_margin = margin_bytes;
+    pool->reclaim_enabled = enabled != 0;
+    return DDO_VMM_SUCCESS;
+}
+
+extern "C" int ddo_vmm_execution_pool_reclaim_stats(
+    ddo_vmm_execution_pool* pool, uint64_t* values, size_t count) {
+    if (!pool || !values || count != 16) return DDO_VMM_INVALID_ARGUMENT;
+    std::scoped_lock lock(pool->mutex);
+    const uint64_t stats[16] = {1, 16, pool->reclaim_enabled, pool->reclaim_margin,
+        pool->reclaim_queries, pool->reclaim_triggers, pool->reclaim_busy,
+        pool->reclaims, pool->reclaimed_bytes, pool->recreations, pool->recreated_bytes,
+        pool->reclaim_unavailable, pool->reclaim_failures, 0, 0, 0};
+    std::copy(std::begin(stats), std::end(stats), values);
+    return DDO_VMM_SUCCESS;
+}
+
+static int execution_backing_pressure_prepare(int device, size_t required, bool reuse) {
+    // An unconfigured runtime preserves the existing allocation route exactly.
+    if (!execution_reclaim_enabled_pools.load()) return DDO_VMM_SUCCESS;
+    const auto result = execution_pressure_registry.visit([&](ddo_vmm_execution_pool* pool) {
+        using execution_reclaim::Result;
+        std::unique_lock lock(pool->mutex, std::try_to_lock);
+        if (!lock.owns_lock() || !pool->reclaim_enabled || pool->slots.empty()
+            || pool->slots.front().arena->device_ordinal != device) return Result::busy;
+        const auto now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (reuse && !pool->reclaim_cadence.claim(now_ms)) return Result::busy;
+        for (const auto& slot : pool->slots) {
+            if (slot.reclaim_poisoned) return Result::failed;
+        }
+        ++pool->reclaim_queries;
+        // Growth keeps its existing immediate check and postpones reuse polling.
+        pool->reclaim_cadence.observed(now_ms);
+        ddo_vmm_windows_memory_info info{};
+#if defined(_WIN32)
+        const bool known = query_windows_memory(device, &info);
+#else
+        const bool known = false;
+#endif
+        const auto decision = !known ? execution_reclaim::Pressure::unavailable
+            : reuse ? execution_reclaim::assess_current(info.local_budget_bytes,
+                info.local_usage_bytes, pool->reclaim_margin)
+            : execution_reclaim::assess(required, info.local_budget_bytes,
+                info.local_usage_bytes, pool->reclaim_margin);
+        if (decision == execution_reclaim::Pressure::unavailable) {
+            ++pool->reclaim_unavailable;
+            last_error = "execution backing pressure observation unavailable";
+            return Result::failed;
+        }
+        if (decision == execution_reclaim::Pressure::retain)
+            return Result::success;
+        ++pool->reclaim_triggers;
+        for (size_t index = 0; index < pool->slots.size(); ++index) {
+            auto& slot = pool->slots[index];
+            if (slot.leased || !slot.materialized) continue;
+            uint64_t released = 0;
+            const auto code = execution_slot_reclaim_locked(pool, index, &released, true);
+            if (code == DDO_VMM_BUSY) continue;
+            if (code != DDO_VMM_SUCCESS) {
+                ++pool->reclaim_failures;
+                return Result::failed;
+            }
+            if (released) return Result::success; // At most one idle slot per request.
+        }
+        ++pool->reclaim_busy;
+        return Result::busy;
+    });
+    return result == execution_reclaim::Result::failed ? DDO_VMM_CUDA_ERROR : DDO_VMM_SUCCESS;
+}
+
+int ddo_vmm_detail::recheck_execution_backing(int device) {
+#if defined(_WIN32)
+    if (device < 0) return DDO_VMM_INVALID_ARGUMENT;
+    return execution_backing_pressure_prepare(device, 0, true);
+#else
+    (void)device;
+    return DDO_VMM_SUCCESS; // WDDM reuse polling does not apply to Linux/WSL.
+#endif
 }
 
 extern "C" const char* ddo_vmm_last_error(void) {

@@ -6,7 +6,8 @@ find_package(Threads REQUIRED)
 enable_testing()
 
 foreach(contract IN ITEMS allocation_footprint cache_selection read_wait
-        source_flights source_scheduler span_ledger span_joined stream_dependency pressure_observations allocation_diagnostics)
+        source_flights source_scheduler span_ledger span_joined stream_dependency pressure_observations allocation_diagnostics
+        execution_reclaim execution_registry execution_recheck)
     add_executable(ddo_${contract}_cpu ../${contract}_test.cpp)
     target_compile_features(ddo_${contract}_cpu PRIVATE cxx_std_20)
     target_include_directories(ddo_${contract}_cpu PRIVATE ../../include)

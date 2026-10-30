@@ -1131,6 +1131,9 @@ class ModelArenaWeightStore:
         result["resident_bytes"] = info.resident_size
         buffer = getattr(self, "execution_buffer", None)
         result["execution_buffer_capacity_bytes"] = buffer.capacity_bytes if buffer is not None else 0
+        if isinstance(buffer, NativeExecutionBuffers):
+            result.update({f"execution_backing_{key}": value
+                           for key, value in buffer.pool.reclaim_stats().items()})
         result["execution_buffer_resident_bytes"] = buffer.resident_bytes if isinstance(buffer, NativeExecutionBuffers) else buffer.native.info.resident_size if buffer is not None else 0
         result["execution_buffer_slots"] = buffer.pool.slots if isinstance(buffer, NativeExecutionBuffers) else 1 if buffer is not None else 0
         result["execution_buffer_slot_bytes"] = buffer.pool.capacity_bytes if isinstance(buffer, NativeExecutionBuffers) else buffer.capacity_bytes if buffer is not None else 0

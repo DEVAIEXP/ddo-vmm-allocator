@@ -1,10 +1,12 @@
 #include "ddo_vmm.h"
+#include "ddo_vmm_execution_recheck.h"
 #include "ddo_vmm_torch_pool.h"
 #include "ddo_vmm_span_ledger.h"
 #include "ddo_vmm_stream_dependency.h"
 #include "ddo_vmm_allocation_diagnostics.h"
 #include "ddo_vmm_allocation_failure_trace.h"
 #include "ddo_vmm_allocation_attempt.h"
+#include "ddo_vmm_owner_observation.h"
 #include <cstdio>
 #ifdef DDO_VMM_POOL_LIFETIME_TRACE
 #include "ddo_vmm_pool_lifetime_trace.h"
@@ -313,6 +315,12 @@ void* ddo_vmm_pool_malloc(size_t bytes, int device, cudaStream_t stream) noexcep
         const size_t granularity = ddo_vmm_device_granularity(device);
         if (!granularity || normalized > SIZE_MAX - (granularity - 1)) return nullptr;
         const size_t mapped = ((normalized + granularity - 1) / granularity) * granularity;
+#if defined(_WIN32)
+        // Preserve context validation and avoid holding the Torch pool lock while
+        // checking execution slots. Reuse does not request more physical bytes.
+        if (ddo_vmm_detail::recheck_execution_backing(device) != DDO_VMM_SUCCESS)
+            return nullptr;
+#endif
         {
             std::scoped_lock lock(pool_mutex);
             for (int pass = 0; pass < 2; ++pass) {
@@ -461,6 +469,27 @@ int ddo_vmm_pool_stats(uint64_t* values, size_t count) noexcept {
         return 0;
     } catch (...) { return 1; }
 }
+
+#ifdef DDO_VMM_MAPPING_TRACE
+extern "C" DDO_VMM_API int ddo_vmm_owner_observe_v1(
+    uint64_t address, uint64_t bytes, uint64_t* output, size_t count) {
+    try {
+        std::scoped_lock lock(pool_mutex);
+        return ddo_vmm_detail::observe_owner(address, bytes, output, count,
+            [](uint64_t query, ddo_vmm_detail::OwnerMetadata& result) {
+                const auto it = records.find(reinterpret_cast<void*>(static_cast<uintptr_t>(query)));
+                if (it == records.end()) return false;
+                const auto& record = it->second;
+                const auto& backing = *record.backing;
+                result = {backing.address, record.lease.generation, record.lease.id,
+                    record.lease.requested, record.lease.offset, record.lease.size,
+                    static_cast<uint64_t>(backing.device),
+                    reinterpret_cast<uintptr_t>(backing.context), backing.retiring ? 1ULL : 0ULL};
+                return true;
+            });
+    } catch (...) { return 1; }
+}
+#endif
 
 #ifdef DDO_VMM_POOL_LIFETIME_TRACE
 // Candidate-only exports. Stream values are raw handles, not proven unique

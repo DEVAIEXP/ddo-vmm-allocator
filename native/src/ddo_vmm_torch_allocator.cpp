@@ -10,6 +10,8 @@
 #include "ddo_vmm_allocation_footprint.h"
 #include "ddo_vmm_cache_selection.h"
 #include "ddo_vmm_allocation_attempt.h"
+#include "ddo_vmm_owner_observation.h"
+#include "ddo_vmm_execution_recheck.h"
 #ifdef DDO_VMM_NATIVE_SPAN_POOL
 #include "ddo_vmm_torch_pool.h"
 #endif
@@ -261,6 +263,12 @@ extern "C" DDO_VMM_API void* ddo_vmm_torch_malloc(
     }
     const size_t minimum_mapped_size = ((requested_size + granularity - 1) / granularity) * granularity;
 
+#if defined(_WIN32)
+    // Check before cache locks, including allocations satisfied by existing backing.
+    if (ddo_vmm_detail::recheck_execution_backing(device_ordinal) != DDO_VMM_SUCCESS)
+        return nullptr;
+#endif
+
     AllocationRecord record;
     if (!take_cached_allocation(minimum_mapped_size, device_ordinal, &record)) {
         // Ordinary PyTorch allocations pass through this native entry point.
@@ -471,3 +479,8 @@ extern "C" DDO_VMM_API int ddo_vmm_torch_allocation_footprint_v1(uint64_t* value
     return 0;
 #endif
 }
+
+#if !defined(DDO_VMM_MAPPING_TRACE) || !defined(DDO_VMM_NATIVE_SPAN_POOL)
+extern "C" DDO_VMM_API int ddo_vmm_owner_observe_v1(
+    uint64_t, uint64_t, uint64_t*, size_t) { return 2; }
+#endif

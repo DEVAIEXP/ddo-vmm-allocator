@@ -45,6 +45,15 @@ DDO_VMM_API int ddo_vmm_execution_pool_acquire(ddo_vmm_execution_pool* pool,
 DDO_VMM_API int ddo_vmm_execution_pool_release(ddo_vmm_execution_pool* pool,
     size_t slot, void* last_use_stream);
 DDO_VMM_API int ddo_vmm_execution_pool_close(ddo_vmm_execution_pool** pool);
+/** Explicit idle-slot reclaim. Requires a completed consumer fence; never waits. */
+DDO_VMM_API int ddo_vmm_execution_pool_reclaim_idle(ddo_vmm_execution_pool* pool,
+    size_t index, uint64_t* released_bytes);
+/** Opt-in Windows DXGI policy. Unsupported platforms refuse enablement. */
+DDO_VMM_API int ddo_vmm_execution_pool_configure_reclaim(ddo_vmm_execution_pool* pool,
+    int enabled, uint64_t margin_bytes);
+/** Version 1: 16 copied uint64_t values; counters describe backing, not placement. */
+DDO_VMM_API int ddo_vmm_execution_pool_reclaim_stats(ddo_vmm_execution_pool* pool,
+    uint64_t* values, size_t count);
 typedef struct ddo_vmm_host_ring ddo_vmm_host_ring;
 typedef struct ddo_vmm_source_file ddo_vmm_source_file;
 typedef struct ddo_vmm_source_cache ddo_vmm_source_cache;
