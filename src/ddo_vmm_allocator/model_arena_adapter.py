@@ -77,6 +77,18 @@ def experimental_execution_unit_level() -> str:
     return _execution_unit_level
 
 
+def _has_sub_block_units(root, unit_names) -> bool:
+    """Whether any execution unit is not itself a ModuleList item (by structure)."""
+    import torch
+
+    by_name = dict(root.named_modules())
+    for name in unit_names:
+        parent = name.rpartition(".")[0]
+        if not isinstance(by_name.get(parent), torch.nn.ModuleList):
+            return True
+    return False
+
+
 def _discover_linear_layout(root, module_pattern):
     """Snapshot selection and enclosing ModuleList units without model names.
 
@@ -2380,8 +2392,11 @@ class ModelArenaModuleAdapter:
         block_units = self._execution_units[: len(unit_modules)]
         for current, following in pairwise(block_units):
             current.prefetch_next = following
-        self._execution_queue = _ObservedExecutionQueue(block_units,
-                                                        learn=_execution_unit_level == "block_child")
+        # Learn the call order only when some unit is a sub-block. When every
+        # unit is a whole list item, enumeration order is the block order, so
+        # block_child keeps block behavior (look-ahead from the first pass).
+        learn = _execution_unit_level == "block_child" and _has_sub_block_units(root, unit_modules)
+        self._execution_queue = _ObservedExecutionQueue(block_units, learn=learn)
 
         if self.store._streaming_enabled and self.store._native_shard_transport is not None:
             # Geometry, not calibrated residency: two native execution slots

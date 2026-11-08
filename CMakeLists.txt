@@ -34,6 +34,17 @@ endif()
 if(DDO_VMM_POOL_LIFETIME_TRACE AND NOT DDO_VMM_NATIVE_SPAN_POOL)
     message(FATAL_ERROR "DDO_VMM_POOL_LIFETIME_TRACE requires DDO_VMM_NATIVE_SPAN_POOL")
 endif()
+option(DDO_VMM_SEGMENTED_DRIVER "Build segmented pool owners, capacity transactions and the growable owner" OFF)
+option(DDO_VMM_AUTO_SEGMENTED "Build cold automatic segmented selection and growable configuration exports" OFF)
+option(DDO_VMM_TIMING_COUNTERS "Build bounded read-only timing, memory and composition observations" OFF)
+foreach(_ddo_pool_feature DDO_VMM_SEGMENTED_DRIVER DDO_VMM_AUTO_SEGMENTED)
+    if(${_ddo_pool_feature} AND NOT DDO_VMM_NATIVE_SPAN_POOL)
+        message(FATAL_ERROR "${_ddo_pool_feature} requires DDO_VMM_NATIVE_SPAN_POOL")
+    endif()
+endforeach()
+if(DDO_VMM_AUTO_SEGMENTED AND NOT DDO_VMM_SEGMENTED_DRIVER)
+    message(FATAL_ERROR "DDO_VMM_AUTO_SEGMENTED requires DDO_VMM_SEGMENTED_DRIVER")
+endif()
 
 # NVIDIA's Linux Python toolkit has a versioned runtime library but may lack
 # the unversioned development symlink FindCUDAToolkit expects. This target uses

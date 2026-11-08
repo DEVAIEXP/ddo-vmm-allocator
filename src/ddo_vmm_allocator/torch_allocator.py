@@ -13,6 +13,16 @@ class TorchAllocatorInstallError(RuntimeError):
 
 _installed_allocator: Any | None = None
 _installed_library_path: Path | None = None
+# The configured library handle is retained for the process lifetime so the
+# cold configuration and the pluggable allocator share one loaded module.
+_configured_library: Any | None = None
+_pool_configuration: dict[str, Any] = {"segmented_auto": False, "growable_reserve_bytes": 0}
+
+# Written by the DDO bootstrap for its child process; explicit arguments win.
+SEGMENTED_AUTO_ENVIRONMENT = "DDO_VMM_SEGMENTED_AUTO"
+GROWABLE_RESERVE_ENVIRONMENT = "DDO_VMM_GROWABLE_RESERVE_BYTES"
+MAX_GROWABLE_RESERVE_BYTES = 64 * 1024**3
+_POOL_CONFIGURATION_EXPORTS = ("ddo_exp_segmented_configure_auto", "ddo_exp_segmented_configure_growable")
 
 
 def installed_library_path() -> Path | None:
@@ -20,8 +30,70 @@ def installed_library_path() -> Path | None:
     return _installed_library_path
 
 
+def installed_pool_configuration() -> dict[str, Any]:
+    """Cold pool configuration applied by the installer (copy)."""
+    return dict(_pool_configuration)
+
+
+def _environment_flag(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    if value not in ("0", "1"):
+        raise TorchAllocatorInstallError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def _environment_bytes(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError as error:
+        raise TorchAllocatorInstallError(f"{name} must be an integer byte count, got {value!r}") from error
+
+
+def _resolve_pool_configuration(segmented_auto: bool | None, growable_reserve_bytes: int | None) -> tuple[bool, int]:
+    if segmented_auto is None:
+        segmented_auto = bool(_environment_flag(SEGMENTED_AUTO_ENVIRONMENT))
+    if growable_reserve_bytes is None:
+        growable_reserve_bytes = _environment_bytes(GROWABLE_RESERVE_ENVIRONMENT) or 0
+    growable_reserve_bytes = int(growable_reserve_bytes)
+    if growable_reserve_bytes < 0 or growable_reserve_bytes > MAX_GROWABLE_RESERVE_BYTES:
+        raise TorchAllocatorInstallError(
+            f"growable reserve must be within [0, {MAX_GROWABLE_RESERVE_BYTES}] bytes, got {growable_reserve_bytes}")
+    if growable_reserve_bytes and not segmented_auto:
+        raise TorchAllocatorInstallError("a growable reserve requires automatic segmented selection")
+    return bool(segmented_auto), growable_reserve_bytes
+
+
+def _apply_pool_configuration(library: Any, segmented_auto: bool, growable_reserve_bytes: int) -> None:
+    """Configure the native pool before its first allocation (cold only)."""
+    if not segmented_auto:
+        return
+    import ctypes
+
+    configure_auto = library.ddo_exp_segmented_configure_auto
+    configure_auto.argtypes = [ctypes.c_int]
+    configure_auto.restype = ctypes.c_int
+    status = configure_auto(1)
+    if status != 0:
+        raise TorchAllocatorInstallError(f"automatic segmented selection was refused (status {status})")
+    if growable_reserve_bytes:
+        configure_growable = library.ddo_exp_segmented_configure_growable
+        configure_growable.argtypes = [ctypes.c_uint64]
+        configure_growable.restype = ctypes.c_int
+        status = configure_growable(growable_reserve_bytes)
+        if status != 0:
+            raise TorchAllocatorInstallError(f"growable reserve configuration was refused (status {status})")
+
+
 def install_pytorch_vmm_allocator(
     library_path: str | os.PathLike[str] | None = None,
+    *,
+    segmented_auto: bool | None = None,
+    growable_reserve_bytes: int | None = None,
 ) -> Any:
     """Install the DLL through PyTorch's official pluggable-allocator API.
 
@@ -29,9 +101,16 @@ def install_pytorch_vmm_allocator(
     once in a process.  Keeping the allocator in a module-level reference is
     required because PyTorch can free allocations after user-level references
     would otherwise be gone.
+
+    ``segmented_auto`` enables automatic segmented pool owners and
+    ``growable_reserve_bytes`` sizes one growable shared owner (0 disables it;
+    it requires ``segmented_auto``).  ``None`` reads the values the DDO
+    bootstrap writes for its child; without them both stay disabled.  The
+    configuration is applied before the allocator is installed and requires a
+    library built with the segmented pool features; it is never ignored.
     """
 
-    global _installed_allocator, _installed_library_path
+    global _installed_allocator, _installed_library_path, _configured_library
     if _installed_allocator is not None:
         return _installed_allocator
 
@@ -41,6 +120,7 @@ def install_pytorch_vmm_allocator(
             "library path is required; pass library_path or set DDO_VMM_LIBRARY_PATH"
         )
     path = Path(resolved_path).expanduser().resolve(strict=True)
+    auto, reserve = _resolve_pool_configuration(segmented_auto, growable_reserve_bytes)
 
     from ._library import load_library, require_exports
 
@@ -48,6 +128,8 @@ def install_pytorch_vmm_allocator(
     require_exports(library, path,
                     ("ddo_vmm_torch_malloc", "ddo_vmm_torch_free"),
                     TorchAllocatorInstallError)
+    if auto:
+        require_exports(library, path, _POOL_CONFIGURATION_EXPORTS, TorchAllocatorInstallError)
 
     import torch
 
@@ -58,10 +140,13 @@ def install_pytorch_vmm_allocator(
             "CUDA is already initialized; start a fresh process through the DDO VMM launcher"
         )
 
+    _apply_pool_configuration(library, auto, reserve)
     allocator = torch.cuda.memory.CUDAPluggableAllocator(
         str(path), "ddo_vmm_torch_malloc", "ddo_vmm_torch_free"
     )
     torch.cuda.memory.change_current_allocator(allocator)
+    _configured_library = library
+    _pool_configuration.update(segmented_auto=auto, growable_reserve_bytes=reserve)
     _installed_allocator = allocator
     _installed_library_path = path
     return allocator

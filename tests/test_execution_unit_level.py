@@ -111,6 +111,33 @@ def test_block_child_attachment_shrinks_the_largest_unit(monkeypatch):
             handle.remove()
 
 
+@pytest.mark.parametrize("root_list", [False, True])
+def test_block_child_with_whole_block_units_keeps_first_pass_look_ahead(monkeypatch, root_list):
+    items = [torch.nn.Linear(4, 4) for _ in range(3)]
+    if root_list:
+        root = torch.nn.ModuleList(items)
+    else:
+        root = torch.nn.Module()
+        root.add_module("blocks", torch.nn.ModuleList(items))
+    configure_experimental_execution_unit_level("block_child")
+    adapter, units, report = attach(root, _discover_linear_layout(root, r".*"), monkeypatch)
+    try:
+        assert report.execution_units == 3
+        assert adapter._execution_queue.learn is False   # Same as block: no learning pass.
+        adapter._execution_queue.begin_pass()
+        assert adapter._execution_queue.consume(units[0]) is units[1]
+    finally:
+        for handle in adapter._handles:
+            handle.remove()
+
+
+def test_sub_block_detection_is_structural():
+    root = model(2)
+    assert adapter_module._has_sub_block_units(root, ["layers.0", "layers.1"]) is False
+    assert adapter_module._has_sub_block_units(root, ["layers.0", "layers.1.attn"]) is True
+    assert adapter_module._has_sub_block_units(root, []) is False
+
+
 def states(count):
     return [SimpleNamespace(name=str(i)) for i in range(count)]
 

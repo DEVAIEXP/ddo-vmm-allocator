@@ -1081,7 +1081,8 @@ void* run_capacity_transaction(int device, CUcontext context, cudaStream_t strea
 #endif
 }
 #ifdef DDO_VMM_AUTO_SEGMENTED_CANDIDATE
-// Private cold opt-in only; never exposed through the installed adapter.
+// Cold opt-in only, applied by install_pytorch_vmm_allocator before the
+// allocator is installed; refused after the first allocation.
 extern "C" DDO_VMM_API int ddo_exp_segmented_configure_auto(int enabled) noexcept {
     try {
         std::scoped_lock lock(pool_mutex);
