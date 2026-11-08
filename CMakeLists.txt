@@ -87,6 +87,19 @@ endif()
 if(DDO_VMM_NATIVE_JOINED_SPANS)
     target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_NATIVE_JOINED_SPANS=1)
 endif()
+# Segmented pool owners with dead-page reuse, capacity transactions and the
+# growable shared owner (cold opt-in, default off at runtime).
+if(DDO_VMM_SEGMENTED_DRIVER)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_SEGMENTED_DRIVER_CANDIDATE=1)
+endif()
+# Automatic segmented selection before CUDA initialization (cold opt-in).
+if(DDO_VMM_AUTO_SEGMENTED)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_AUTO_SEGMENTED_CANDIDATE=1)
+endif()
+# Bounded read-only timing, memory and composition observation exports.
+if(DDO_VMM_TIMING_COUNTERS)
+    target_compile_definitions(ddo_vmm PRIVATE DDO_VMM_TIMING_COUNTERS=1)
+endif()
 
 if(WIN32)
     target_link_libraries(ddo_vmm PRIVATE dxgi)
@@ -99,6 +112,7 @@ else()
 endif()
 
 if(DDO_VMM_BUILD_PROBES)
+    enable_testing()
     foreach(contract execution_reclaim execution_registry)
         add_executable(ddo_vmm_${contract}_test native/tests/${contract}_test.cpp)
         target_compile_features(ddo_vmm_${contract}_test PRIVATE cxx_std_20)
@@ -171,6 +185,38 @@ if(DDO_VMM_BUILD_PROBES)
     add_executable(ddo_vmm_stream_dependency_test native/tests/stream_dependency_test.cpp)
     target_compile_features(ddo_vmm_stream_dependency_test PRIVATE cxx_std_20)
     target_include_directories(ddo_vmm_stream_dependency_test PRIVATE native/include)
+    # Pure CPU contracts for access recovery, completed backing and pool geometry.
+    foreach(contract access_recovery arena_access completed_backing completed_pool
+            pool_geometry pool_geometry_capture)
+        add_executable(ddo_vmm_${contract}_test native/tests/${contract}_test.cpp)
+        target_compile_features(ddo_vmm_${contract}_test PRIVATE cxx_std_20)
+        target_include_directories(ddo_vmm_${contract}_test PRIVATE native/include "${CUDAToolkit_INCLUDE_DIRS}")
+        target_compile_options(ddo_vmm_${contract}_test PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+        add_test(NAME ddo_vmm_${contract}_test COMMAND ddo_vmm_${contract}_test)
+    endforeach()
+    if(WIN32)
+        add_executable(ddo_vmm_segmented_storage_cpu native/tests/segmented_storage_cpu.cpp)
+        target_compile_features(ddo_vmm_segmented_storage_cpu PRIVATE cxx_std_20)
+        target_include_directories(ddo_vmm_segmented_storage_cpu PRIVATE native/include "${CUDAToolkit_INCLUDE_DIRS}")
+        add_test(NAME ddo_vmm_segmented_storage_cpu COMMAND ddo_vmm_segmented_storage_cpu)
+        # Segmented pool contracts: the real pool source with in-process Driver
+        # doubles; CUDA headers only, never a GPU library, context or device.
+        foreach(contract growable composition retention timing transaction status inherited)
+            add_executable(ddo_vmm_${contract}_cpu native/tests/contracts/${contract}_cpu.cpp)
+            target_compile_features(ddo_vmm_${contract}_cpu PRIVATE cxx_std_20)
+            target_include_directories(ddo_vmm_${contract}_cpu PRIVATE
+                native/include native/tests/contracts "${CMAKE_CURRENT_SOURCE_DIR}" "${CUDAToolkit_INCLUDE_DIRS}")
+            target_compile_definitions(ddo_vmm_${contract}_cpu PRIVATE DDO_VMM_CPU_API DDO_VMM_SEGMENTED_POOL_CPU
+                DDO_VMM_SEGMENTED_DRIVER_CANDIDATE DDO_VMM_NATIVE_JOINED_SPANS DDO_VMM_AUTO_SEGMENTED_CANDIDATE
+                DDO_VMM_TIMING_COUNTERS)
+            if(MSVC)
+                target_compile_options(ddo_vmm_${contract}_cpu PRIVATE /W4 /WX /permissive-)
+            endif()
+            add_test(NAME ddo_vmm_${contract}_cpu COMMAND ddo_vmm_${contract}_cpu)
+        endforeach()
+    endif()
     add_executable(ddo_vmm_driver_probe native/tests/vmm_driver_probe.cpp)
     target_compile_features(ddo_vmm_driver_probe PRIVATE cxx_std_20)
     target_link_libraries(ddo_vmm_driver_probe PRIVATE ddo_vmm CUDA::cuda_driver)
