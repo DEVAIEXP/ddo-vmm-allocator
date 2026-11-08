@@ -55,12 +55,35 @@ except ImportError:
     RegisteredHostWeightRegistry = None
 
 
+# Experimental execution-unit granularity (process-wide, set before attachment).
+# "block" (default): the outermost ModuleList item fences all selected
+# descendants. "block_child": each direct child of that item is its own unit
+# (a Linear that is itself a direct child stays its own unit), so execution
+# slots fit the largest child instead of the whole item. Structure only; no
+# model or class names.
+_EXECUTION_UNIT_LEVELS = ("block", "block_child")
+_execution_unit_level = "block"
+
+
+def configure_experimental_execution_unit_level(level: str) -> None:
+    """Select the execution-unit granularity for later attachments."""
+    global _execution_unit_level
+    if level not in _EXECUTION_UNIT_LEVELS:
+        raise ValueError(f"unsupported execution unit level {level!r}")
+    _execution_unit_level = level
+
+
+def experimental_execution_unit_level() -> str:
+    return _execution_unit_level
+
+
 def _discover_linear_layout(root, module_pattern):
     """Snapshot selection and enclosing ModuleList units without model names.
 
     Keep enumeration order and parameter alignment identical to attachment.
     The snapshot retains modules, never detached loader tensors. The outermost
-    list item fences all selected descendants, including nested lists.
+    list item fences all selected descendants, including nested lists; at the
+    experimental ``block_child`` level its direct children are the units.
     """
     import torch
 
@@ -77,6 +100,7 @@ def _discover_linear_layout(root, module_pattern):
     selected = []
     units = {}
     payload = 0
+    by_name = dict(modules) if _execution_unit_level == "block_child" else None
     for name, module in modules:
         if not isinstance(module, torch.nn.Linear):
             continue
@@ -86,7 +110,11 @@ def _discover_linear_layout(root, module_pattern):
             continue
         selected.append((name, module))
         unit = next((parent for parent in ancestors if parent in list_items), None)
-        if unit is not None:
+        if unit is not None and by_name is not None and name != unit:
+            # Direct child of the outermost item that contains this Linear.
+            child = unit + "." + name[len(unit) + 1:].split(".")[0]
+            units[name] = (child, by_name[child])
+        elif unit is not None:
             units[name] = (unit, list_items[unit])
         for parameter_name in ("weight", "bias"):
             parameter = getattr(module, parameter_name, None)
@@ -920,8 +948,32 @@ class _ObservedExecutionQueue:
     states: list[_ModuleBinding]
     cursor: int = 0
     valid: bool = True
+    # Experimental sub-block units: enumeration order need not be call order.
+    # With ``learn`` the first pass records the observed order without
+    # look-ahead; the next pass adopts it only if every unit ran exactly once,
+    # otherwise the enumeration order (with the existing validation) is kept.
+    learn: bool = False
+    recorded: list | None = None
+    learn_failed: bool = False
+    learned: bool = False
 
     def begin_pass(self) -> None:
+        if self.learn:
+            if self.recorded is not None and not self.learn_failed:
+                complete = len(self.recorded) == len(self.states) and all(
+                    any(r is s for s in self.states) for r in self.recorded)
+                if complete:
+                    self.states = list(self.recorded)
+                    self.learned = True
+                else:
+                    self.learn_failed = True
+                self.learn = False
+                self.recorded = None
+            elif self.recorded is not None:
+                self.learn = False
+                self.recorded = None
+            else:
+                self.recorded = []
         self.cursor = 0
         self.valid = True
 
@@ -930,6 +982,14 @@ class _ObservedExecutionQueue:
         # They are not part of this queue and must not invalidate the observed
         # block sequence merely by having their own hook.
         if state not in self.states:
+            return None
+        if self.learn and self.recorded is not None:
+            # Learning pass: record, never look ahead. A repeated unit means a
+            # dynamic or re-entrant order that is not learned.
+            if any(r is state for r in self.recorded):
+                self.learn_failed = True
+            else:
+                self.recorded.append(state)
             return None
         if not self.valid or self.cursor >= len(self.states) or self.states[self.cursor] is not state:
             self.valid = False
@@ -2320,7 +2380,8 @@ class ModelArenaModuleAdapter:
         block_units = self._execution_units[: len(unit_modules)]
         for current, following in pairwise(block_units):
             current.prefetch_next = following
-        self._execution_queue = _ObservedExecutionQueue(block_units)
+        self._execution_queue = _ObservedExecutionQueue(block_units,
+                                                        learn=_execution_unit_level == "block_child")
 
         if self.store._streaming_enabled and self.store._native_shard_transport is not None:
             # Geometry, not calibrated residency: two native execution slots
