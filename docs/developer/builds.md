@@ -10,9 +10,15 @@ cmake -S . -B build-linux-candidate \
   -DDDO_VMM_BUILD_PROBES=OFF -DDDO_VMM_NATIVE_SPAN_POOL=ON \
   -DDDO_VMM_NATIVE_JOINED_SPANS=OFF -DDDO_VMM_NATIVE_SOURCE_DISPATCHER=OFF \
   -DDDO_VMM_SOURCE_TEST_HOOKS=OFF -DDDO_VMM_ALLOCATION_DIAGNOSTICS=OFF \
-  -DDDO_VMM_BUILD_EXECUTION_OPS=OFF
+  -DDDO_VMM_BUILD_EXECUTION_OPS=OFF -DDDO_VMM_SEGMENTED_DRIVER=ON \
+  -DDDO_VMM_AUTO_SEGMENTED=ON -DDDO_VMM_TIMING_COUNTERS=ON
 cmake --build build-linux-candidate --parallel 2
 ```
+`DDO_VMM_SEGMENTED_DRIVER` and `DDO_VMM_AUTO_SEGMENTED` require the span pool;
+automatic selection also requires the segmented driver. They build the cold
+configuration exports that `install_pytorch_vmm_allocator(segmented_auto=...,
+growable_reserve_bytes=...)` and the DDO bootstrap defaults require; a library
+built without them is refused when that configuration is requested.
 Windows uses the reviewed MSVC/CMake configuration; selected joined-span artifacts
 have different features, so do not assume this Linux recipe reproduces them.
 `DDO_VMM_MAPPING_TRACE=ON` is a Windows-only opt-in diagnostic build feature.
