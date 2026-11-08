@@ -3,7 +3,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(_WIN32)
+#if defined(DDO_VMM_CPU_API)
+#define DDO_VMM_API
+#elif defined(_WIN32)
 #if defined(DDO_VMM_BUILDING_LIBRARY)
 #define DDO_VMM_API __declspec(dllexport)
 #else

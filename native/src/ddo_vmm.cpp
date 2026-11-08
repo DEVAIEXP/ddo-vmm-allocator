@@ -6,8 +6,18 @@
 #include "ddo_vmm_read_wait.h"
 #include "ddo_vmm_allocation_diagnostics.h"
 #include "ddo_vmm_allocation_attempt.h"
+#include "ddo_vmm_access_recovery.h"
+#include "ddo_vmm_arena_access.h"
+#include "access_oom.h"
 #include "ddo_vmm_budget_admission.h"
 #include "ddo_vmm_execution_recheck.h"
+#include "ddo_vmm_capacity_transaction.h"
+#ifdef DDO_VMM_TIMING_COUNTERS
+#include "ddo_vmm_timing_counters.h"
+#endif
+#ifdef DDO_VMM_NATIVE_SPAN_POOL
+#include "ddo_vmm_torch_pool.h"
+#endif
 
 #include <cuda.h>
 
@@ -39,10 +49,13 @@
 CUresult ddo_trace_mem_map(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
 CUresult ddo_trace_mem_unmap(CUdeviceptr, size_t);
 CUresult ddo_trace_mem_release(CUmemGenericAllocationHandle);
+CUresult ddo_trace_mem_set_access(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
+#define DDO_MEM_SET_ACCESS(...) ddo_trace_mem_set_access(__VA_ARGS__)
 #define DDO_MEM_MAP(...) ddo_trace_mem_map(__VA_ARGS__)
 #define DDO_MEM_UNMAP(...) ddo_trace_mem_unmap(__VA_ARGS__)
 #define DDO_MEM_RELEASE(...) ddo_trace_mem_release(__VA_ARGS__)
 #else
+#define DDO_MEM_SET_ACCESS(...) ::cuMemSetAccess(__VA_ARGS__)
 #define DDO_MEM_MAP(...) ::cuMemMap(__VA_ARGS__)
 #define DDO_MEM_UNMAP(...) ::cuMemUnmap(__VA_ARGS__)
 #define DDO_MEM_RELEASE(...) ::cuMemRelease(__VA_ARGS__)
@@ -53,12 +66,13 @@ namespace ddo_vmm_detail { AllocationDiagnostics allocation_diagnostics; }
 // Wrap only this native implementation's calls; disabled builds call the driver directly.
 #define cuMemCreate(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::create, [&] { return ::cuMemCreate(__VA_ARGS__); })
 #define cuMemMap(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::map, [&] { return DDO_MEM_MAP(__VA_ARGS__); })
-#define cuMemSetAccess(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::access, [&] { const auto result = ::cuMemSetAccess(__VA_ARGS__); ddo_vmm_detail::allocation_diagnostics.access_result(result, CUDA_ERROR_NOT_READY, CUDA_ERROR_OUT_OF_MEMORY); return result; })
+#define cuMemSetAccess(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::access, [&] { const auto result = DDO_MEM_SET_ACCESS(__VA_ARGS__); ddo_vmm_detail::allocation_diagnostics.access_result(result, CUDA_ERROR_NOT_READY, CUDA_ERROR_OUT_OF_MEMORY); return result; })
 #define cuMemUnmap(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::unmap, [&] { return DDO_MEM_UNMAP(__VA_ARGS__); })
 #define cuMemRelease(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::release, [&] { return DDO_MEM_RELEASE(__VA_ARGS__); })
 #define cuMemAddressReserve(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::reserve, [&] { return ::cuMemAddressReserve(__VA_ARGS__); })
 #define cuMemAddressFree(...) ddo_vmm_detail::allocation_diagnostics.measure(ddo_vmm_detail::AllocationDiagnostics::address_free, [&] { return ::cuMemAddressFree(__VA_ARGS__); })
 #elif defined(DDO_VMM_MAPPING_TRACE)
+#define cuMemSetAccess(...) DDO_MEM_SET_ACCESS(__VA_ARGS__)
 #define cuMemMap(...) DDO_MEM_MAP(__VA_ARGS__)
 #define cuMemUnmap(...) DDO_MEM_UNMAP(__VA_ARGS__)
 #define cuMemRelease(...) DDO_MEM_RELEASE(__VA_ARGS__)
@@ -277,6 +291,12 @@ struct ddo_vmm_region {
 struct ddo_vmm_model_arena {
     int device_ordinal = -1;
     std::mutex mutation_mutex;
+    std::atomic<bool> access_poisoned{false};
+    // Retained failed transition, separate from successfully published pages.
+    CUmemGenericAllocationHandle failed_access_allocation = 0;
+    CUdeviceptr failed_access_address = 0;
+    bool failed_access_mapped = false;
+    CUcontext failed_access_context = nullptr;
     CUdeviceptr address = 0;
     size_t virtual_size = 0;
     size_t page_size = 0;
@@ -292,6 +312,7 @@ struct ddo_vmm_model_arena {
     CUevent compute_fence = nullptr;
     bool compute_fence_recorded = false;
     bool streaming_admission = false;
+    bool execution_slot = false; // Owned by an execution pool (observation split only).
     CUmemGenericAllocationHandle view_bootstrap_allocation = 0;
     CUcontext retained_primary_context = nullptr;
     ddo_vmm_backing_kind backing_kind = DDO_VMM_BACKING_DEVICE;
@@ -449,7 +470,15 @@ void host_ring_source_worker(ddo_vmm_host_ring* ring) {
         }
         ring->source_space.notify_one();
         std::string error;
+#ifdef DDO_VMM_TIMING_COUNTERS
+        const uint64_t read_started = ddo_vmm_detail::timing_now_ns();
+#endif
         const bool succeeded = ddo_source_io::read_file(task.file, task.offset, task.destination, task.size, error);
+#ifdef DDO_VMM_TIMING_COUNTERS
+        // Worker wall time; workers run concurrently, so totals can exceed elapsed time.
+        ddo_vmm_detail::timing_counters.add(ddo_vmm_detail::TimingOp::source_read,
+            ddo_vmm_detail::timing_now_ns() - read_started, task.size);
+#endif
         ring->source_read_chunks.fetch_add(1, std::memory_order_relaxed);
         ring->source_read_bytes.fetch_add(task.size, std::memory_order_relaxed);
         if (!succeeded) {
@@ -725,6 +754,10 @@ void release_temporary_primary_context(int device_ordinal, CUcontext temporary_p
 }
 
 bool activate_model_arena_context(const ddo_vmm_model_arena* arena, CUcontext* temporary_primary_context) {
+    if (arena->access_poisoned.load()) {
+        last_error = "model arena retained after unproven access rollback";
+        return false;
+    }
     if (arena->retained_primary_context != nullptr) {
         return checked(cuCtxSetCurrent(arena->retained_primary_context), "cuCtxSetCurrent");
     }
@@ -747,6 +780,10 @@ uint64_t mix_signature(uint64_t value, uint64_t page, uint64_t generation) {
 
 bool release_model_arena_page(ddo_vmm_model_arena* arena, size_t page_index) {
     if (arena == nullptr || page_index >= arena->pages.size()) {
+        return false;
+    }
+    if (arena->access_poisoned.load()) {
+        last_error = "model arena retained after unproven access rollback";
         return false;
     }
     auto& page = arena->pages[page_index];
@@ -772,8 +809,13 @@ bool release_model_arena_page(ddo_vmm_model_arena* arena, size_t page_index) {
 bool model_arena_evict_one(
     ddo_vmm_model_arena* arena,
     size_t protected_begin = std::numeric_limits<size_t>::max(),
-    size_t protected_end = std::numeric_limits<size_t>::max()
+    size_t protected_end = std::numeric_limits<size_t>::max(),
+    bool* release_failed = nullptr
 ) {
+    // Optional, additive failure report: existing callers are unchanged.
+    if (release_failed != nullptr) {
+        *release_failed = false;
+    }
     // Model weights are packed in observed execution order.  On pressure,
     // preserve the contiguous low-address prefix and recover the newest
     // eligible high-address page.  This is native arena policy, independent
@@ -791,6 +833,9 @@ bool model_arena_evict_one(
         if (release_model_arena_page(arena, candidate_index)) {
             arena->tail_evictions += 1;
             return true;
+        }
+        if (release_failed != nullptr) {
+            *release_failed = true;
         }
         return false;
     }
@@ -1060,15 +1105,40 @@ extern "C" ddo_vmm_status ddo_vmm_region_create_ex(
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id = device_ordinal;
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    if (!checked(cuMemSetAccess(region->address, mapped_size, &access, 1), "cuMemSetAccess")) {
-        cuMemUnmap(region->address, region->mapped_size);
-        cuMemRelease(region->allocation);
-        cuMemAddressFree(region->address, region->mapped_size);
-        if (region->retained_primary_context != nullptr) {
-            cuCtxSetCurrent(nullptr);
-            cuDevicePrimaryCtxRelease(device_ordinal);
+    bool barrier_failed = false;
+    const auto access_result = ddo_vmm_detail::recover_access_once(
+        CUDA_SUCCESS, CUDA_ERROR_NOT_READY,
+        [&] { return cuMemSetAccess(region->address, mapped_size, &access, 1); },
+        [&] {
+#ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
+            const auto status = ddo_vmm_detail::allocation_diagnostics.measure(
+                ddo_vmm_detail::AllocationDiagnostics::access_retry_sync,
+                [&] { return cuCtxSynchronize(); });
+#else
+            const auto status = cuCtxSynchronize();
+#endif
+            barrier_failed = status != CUDA_SUCCESS;
+            return status;
+        });
+    if (!checked(access_result, barrier_failed ? "cuCtxSynchronize after cuMemSetAccess" : "cuMemSetAccess")) {
+        const auto rollback = ddo_vmm_detail::rollback_failed_access(
+            access_result, CUDA_SUCCESS, CUDA_ERROR_OUT_OF_MEMORY, barrier_failed,
+            [&] { return cuMemUnmap(region->address, region->mapped_size); },
+            [&] { return cuMemRelease(region->allocation); },
+            [&] { return cuMemAddressFree(region->address, region->mapped_size); },
+            [&] {
+                if (region->retained_primary_context == nullptr) return CUDA_SUCCESS;
+                const auto detached = cuCtxSetCurrent(nullptr);
+                if (detached != CUDA_SUCCESS) return detached;
+                return cuDevicePrimaryCtxRelease(device_ordinal);
+            });
+        if (rollback == ddo_vmm_detail::AccessRollback::retain) {
+            last_error += " (partial region retained after unsafe access failure)";
+            // No owner may retry cleanup after an unproven driver transition.
+            (void)region.release();
         }
-        return DDO_VMM_CUDA_ERROR;
+        return rollback == ddo_vmm_detail::AccessRollback::evictable_oom
+            ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
     }
 
     *out_region = region.release();
@@ -1395,6 +1465,10 @@ extern "C" void ddo_vmm_model_arena_destroy(ddo_vmm_model_arena* arena) {
     // before releasing its virtual reservation or physical backing.
     unregister_model_arena_pressure(arena);
     std::unique_lock mutation_lock(arena->mutation_mutex);
+    if (arena->access_poisoned.load()) {
+        last_error = "model arena retained after unproven access rollback";
+        return;
+    }
     if (cuInit(0) == CUDA_SUCCESS) {
         CUcontext temporary_primary_context = nullptr;
         if (activate_model_arena_context(arena, &temporary_primary_context)) {
@@ -1557,6 +1631,11 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
         last_error = "model arena range and signature output must be valid";
         return DDO_VMM_INVALID_ARGUMENT;
     }
+    *out_signature = 0;
+    if (arena->access_poisoned.load()) {
+        last_error = "model arena retained after unproven access rollback";
+        return DDO_VMM_CUDA_ERROR;
+    }
     last_error.clear();
     if (offset_bytes > arena->virtual_size || size_bytes > arena->virtual_size - offset_bytes) {
         last_error = "model arena range is outside the reserved address span";
@@ -1588,6 +1667,7 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
         release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
         return DDO_VMM_CUDA_ERROR;
     }
+    bool pool_recovery_used = false;
     for (size_t page_index = begin_page; page_index < end_page; ++page_index) {
         auto& page = arena->pages[page_index];
         if (page.allocation != 0) {
@@ -1630,54 +1710,113 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_fault_range(
             release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
             return guard_status;
         }
-        CUmemGenericAllocationHandle allocation = 0;
-        const auto create_result = cuMemCreate(&allocation, arena->page_size, &properties, 0);
-        if (create_result != CUDA_SUCCESS) {
-            if (create_result == CUDA_ERROR_OUT_OF_MEMORY) {
-                model_arena_limit_admission(arena, page_index, "CUDA allocation pressure");
+        bool create_oom = false;
+        const auto materialize_page = [&]() -> ddo_vmm_status {
+            CUmemGenericAllocationHandle allocation = 0;
+            const auto create_result = cuMemCreate(&allocation, arena->page_size, &properties, 0);
+            if (create_result != CUDA_SUCCESS) {
+                create_oom = create_result == CUDA_ERROR_OUT_OF_MEMORY;
+                set_error("cuMemCreate", create_result);
+                return create_result == CUDA_ERROR_OUT_OF_MEMORY
+                    ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
             }
-            set_error("cuMemCreate", create_result);
-            if (create_result == CUDA_ERROR_OUT_OF_MEMORY) {
-                last_error = "model arena admission boundary reached by CUDA allocation pressure: "
-                    + last_error;
+            const CUdeviceptr page_address = arena->address + page_index * arena->page_size;
+            if (!checked(cuMemMap(page_address, arena->page_size, 0, allocation, 0), "cuMemMap")) {
+                cuMemRelease(allocation);
+                return DDO_VMM_CUDA_ERROR;
             }
-            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
-            return create_result == CUDA_ERROR_OUT_OF_MEMORY
-                ? DDO_VMM_OUT_OF_MEMORY : DDO_VMM_CUDA_ERROR;
-        }
-        const CUdeviceptr page_address = arena->address + page_index * arena->page_size;
-        if (!checked(cuMemMap(page_address, arena->page_size, 0, allocation, 0), "cuMemMap")) {
-            cuMemRelease(allocation);
-            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
-            return DDO_VMM_CUDA_ERROR;
-        }
-        CUmemAccessDesc access{};
-        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access.location.id = arena->device_ordinal;
-        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        CUresult access_result = CUDA_ERROR_NOT_READY;
-        for (int attempt = 0; attempt < 4 && access_result == CUDA_ERROR_NOT_READY; ++attempt) {
-            access_result = cuMemSetAccess(page_address, arena->page_size, &access, 1);
-            if (access_result == CUDA_ERROR_NOT_READY) {
+            CUmemAccessDesc access{};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = arena->device_ordinal;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            bool barrier_failed = false;
+            const auto access_result = ddo_vmm_detail::recover_access_once(
+                CUDA_SUCCESS, CUDA_ERROR_NOT_READY,
+                [&] { return cuMemSetAccess(page_address, arena->page_size, &access, 1); },
+                [&] {
 #ifdef DDO_VMM_ALLOCATION_DIAGNOSTICS
-                ddo_vmm_detail::allocation_diagnostics.measure(
-                    ddo_vmm_detail::AllocationDiagnostics::access_retry_sync,
-                    [&] { return cuCtxSynchronize(); });
+                    const auto status = ddo_vmm_detail::allocation_diagnostics.measure(
+                        ddo_vmm_detail::AllocationDiagnostics::access_retry_sync,
+                        [&] { return cuCtxSynchronize(); });
 #else
-                cuCtxSynchronize();
+                    const auto status = cuCtxSynchronize();
 #endif
+                    barrier_failed = status != CUDA_SUCCESS;
+                    return status;
+                });
+            if (!checked(access_result, barrier_failed ? "cuCtxSynchronize after cuMemSetAccess" : "cuMemSetAccess")) {
+                const auto rollback = ddo_vmm_detail::rollback_arena_access(
+                    access_result, CUDA_SUCCESS, CUDA_ERROR_OUT_OF_MEMORY, barrier_failed,
+                    [&] { return cuMemUnmap(page_address, arena->page_size); },
+                    [&] { return cuMemRelease(allocation); },
+                    [&] {
+                        if (!temporary_primary_context) return CUDA_SUCCESS;
+                        const auto detached = cuCtxSetCurrent(nullptr);
+                        if (detached != CUDA_SUCCESS) return detached;
+                        const auto status = cuDevicePrimaryCtxRelease(arena->device_ordinal);
+                        if (status == CUDA_SUCCESS) temporary_primary_context = nullptr;
+                        return status;
+                    });
+                if (rollback.disposition == ddo_vmm_detail::ArenaAccessDisposition::clean_oom) {
+                    return DDO_VMM_OUT_OF_MEMORY;
+                }
+                arena->failed_access_allocation = rollback.allocation_live ? allocation : 0;
+                arena->failed_access_address = page_address;
+                arena->failed_access_mapped = rollback.mapped;
+                arena->failed_access_context = rollback.context_released ? nullptr : temporary_primary_context;
+                if (rollback.allocation_live) ++arena->resident_pages;
+                arena->access_poisoned.store(true);
+                last_error += " (model arena retained after unproven access rollback)";
+                return DDO_VMM_CUDA_ERROR;
+            }
+            page.allocation = allocation;
+            page.generation += 1;
+            arena->resident_pages += 1;
+            arena->materialized_pages += 1;
+            return DDO_VMM_SUCCESS;
+        };
+        auto page_status = materialize_page();
+#ifdef DDO_VMM_NATIVE_SPAN_POOL
+        if (page_status == DDO_VMM_OUT_OF_MEMORY && !pool_recovery_used
+            && arena->backing_kind == DDO_VMM_BACKING_DEVICE) {
+            pool_recovery_used = true;
+            const auto original_error = last_error;
+            // A clean access rollback may have released a temporary context.
+            // Reactivate it before selecting same-context idle pool backing.
+            if (!activate_model_arena_context(arena, &temporary_primary_context))
+                return DDO_VMM_CUDA_ERROR;
+            CUcontext current = nullptr;
+            if (!checked(cuCtxGetCurrent(&current), "cuCtxGetCurrent before arena pool recovery")) {
+                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+                return DDO_VMM_CUDA_ERROR;
+            }
+            const auto recovery = ddo_vmm_pool_release_for_arena(arena->device_ordinal,
+                reinterpret_cast<uintptr_t>(current), arena->page_size);
+            if (recovery.status == ddo_vmm_detail::CompletedRelease::failed) {
+                last_error = original_error + " (completed Torch backing recovery failed)";
+                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+                return DDO_VMM_CUDA_ERROR;
+            }
+            last_error = original_error;
+            if (recovery.bytes != 0) {
+                create_oom = false;
+                page_status = materialize_page();
+                if (page_status == DDO_VMM_SUCCESS) last_error.clear();
             }
         }
-        if (!checked(access_result, "cuMemSetAccess")) {
-            cuMemUnmap(page_address, arena->page_size);
-            cuMemRelease(allocation);
-            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
-            return DDO_VMM_CUDA_ERROR;
+#else
+        (void)pool_recovery_used;
+#endif
+        if (page_status != DDO_VMM_SUCCESS) {
+            if (create_oom) {
+                model_arena_limit_admission(arena, page_index, "CUDA allocation pressure");
+                last_error = "model arena admission boundary reached by CUDA allocation pressure: " + last_error;
+            }
+            // Poisoned transitions own their temporary context explicitly.
+            if (!arena->access_poisoned.load())
+                release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+            return page_status;
         }
-        page.allocation = allocation;
-        page.generation += 1;
-        arena->resident_pages += 1;
-        arena->materialized_pages += 1;
     }
 
     uint64_t signature = 0x1234abcd5678ef00ULL;
@@ -1700,6 +1839,12 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_peek_range_signature(
         return DDO_VMM_INVALID_ARGUMENT;
     }
     std::lock_guard<std::mutex> lock(arena->mutation_mutex);
+    if (arena->access_poisoned.load()) {
+        *out_signature = 0;
+        *out_resident = 0;
+        last_error = "model arena retained after unproven access rollback";
+        return DDO_VMM_CUDA_ERROR;
+    }
     if (offset_bytes > arena->virtual_size || size_bytes > arena->virtual_size - offset_bytes) {
         last_error = "model arena observation is outside the reserved address span";
         return DDO_VMM_INVALID_ARGUMENT;
@@ -2172,6 +2317,10 @@ extern "C" ddo_vmm_status ddo_vmm_model_arena_unpin_range(
     if (arena == nullptr || size_bytes == 0) {
         last_error = "model arena range must be valid";
         return DDO_VMM_INVALID_ARGUMENT;
+    }
+    if (arena->access_poisoned.load()) {
+        last_error = "model arena retained after unproven access rollback";
+        return DDO_VMM_CUDA_ERROR;
     }
     last_error.clear();
     if (offset_bytes > arena->virtual_size || size_bytes > arena->virtual_size - offset_bytes) {
@@ -2724,6 +2873,122 @@ extern "C" int ddo_vmm_pressure_evict_one(int device_ordinal) {
     return 1;
 }
 
+namespace ddo_vmm_detail {
+// Segmented capacity transaction, Tier 2. Same lock order and arena selection
+// as ddo_vmm_pressure_evict_one, restricted to model-arena pages, reporting
+// bytes and distinguishing "nothing eligible" from a Driver release failure.
+ArenaPressureCount pressure_count_arena_pages(int device_ordinal) noexcept {
+    ArenaPressureCount result;
+    try {
+        std::scoped_lock lock(pressure_mutex);
+        for (const ModelArenaPressureEntry& entry : pressure_model_arenas) {
+            ddo_vmm_model_arena* arena = entry.arena;
+            if (arena == nullptr || arena->device_ordinal != device_ordinal) {
+                continue;
+            }
+            std::unique_lock<std::mutex> arena_lock(arena->mutation_mutex, std::try_to_lock);
+            if (!arena_lock.owns_lock()) {
+                ++result.busy_arenas;
+                continue;
+            }
+            for (const auto& page : arena->pages) {
+                if (page.allocation != 0 && page.pin_count == 0) {
+                    ++result.evictable_pages;
+                }
+            }
+        }
+    } catch (...) {
+        result.evictable_pages = 0;
+    }
+    return result;
+}
+
+ArenaComposition observe_arena_composition(int device_ordinal) noexcept {
+    ArenaComposition result;
+    try {
+        std::unique_lock<std::mutex> lock(pressure_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return result;
+        }
+        result.registry_observed = true;
+        for (const ModelArenaPressureEntry& entry : pressure_model_arenas) {
+            ddo_vmm_model_arena* arena = entry.arena;
+            if (arena == nullptr || arena->device_ordinal != device_ordinal) {
+                continue;
+            }
+            std::unique_lock<std::mutex> arena_lock(arena->mutation_mutex, std::try_to_lock);
+            if (!arena_lock.owns_lock()) {
+                ++result.busy_arenas;
+                continue;
+            }
+            const uint64_t bytes = static_cast<uint64_t>(arena->resident_pages) * arena->page_size;
+            if (arena->execution_slot) {
+                ++result.slot_arenas;
+                result.slot_bytes += bytes;
+            } else {
+                ++result.model_arenas;
+                result.model_bytes += bytes;
+            }
+        }
+        // Same unlocked read the pressure eviction path performs under this mutex.
+        for (const PressureEntry& entry : pressure_entries) {
+            if (entry.region == nullptr || entry.region->device_ordinal != device_ordinal) {
+                continue;
+            }
+            ++result.regions;
+            result.region_bytes += region_resident_size(entry.region);
+        }
+    } catch (...) {
+        result = ArenaComposition{};
+    }
+    return result;
+}
+
+ArenaEvictionResult pressure_evict_arena_page(int device_ordinal) noexcept {
+    ArenaEvictionResult result;
+    try {
+        std::scoped_lock lock(pressure_mutex);
+        for (const ModelArenaPressureEntry& entry : pressure_model_arenas) {
+            ddo_vmm_model_arena* arena = entry.arena;
+            if (arena == nullptr || arena->device_ordinal != device_ordinal) {
+                continue;
+            }
+            std::unique_lock<std::mutex> arena_lock(arena->mutation_mutex, std::try_to_lock);
+            if (!arena_lock.owns_lock()) {
+                ++result.busy_arenas;
+                continue;
+            }
+            if (arena->resident_pages == 0) {
+                continue;
+            }
+            CUcontext temporary_primary_context = nullptr;
+            if (!activate_model_arena_context(arena, &temporary_primary_context)) {
+                continue;
+            }
+            bool release_failed = false;
+            const bool evicted = model_arena_evict_one(arena,
+                std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max(), &release_failed);
+            release_temporary_primary_context(arena->device_ordinal, temporary_primary_context);
+            if (evicted) {
+                arena->pressure_evictions += 1;
+                result.outcome = ArenaEviction::evicted;
+                result.bytes = arena->page_size;
+                return result;
+            }
+            if (release_failed) {
+                // Known limitation: release_model_arena_page may leave the page
+                // counted resident after a partial unmap/release. Stop here.
+                result.outcome = ArenaEviction::failed;
+                return result;
+            }
+        }
+    } catch (...) {
+        result.outcome = ArenaEviction::failed;
+    }
+    return result;
+}
+}
+
 extern "C" ddo_vmm_status ddo_vmm_pressure_prepare_cuda_allocation(
     int device_ordinal,
     size_t required_bytes
@@ -2797,6 +3062,10 @@ extern "C" int ddo_vmm_model_arena_enable_streaming(
 ) {
     if (!arena || !execution_buffer_bytes) return DDO_VMM_INVALID_ARGUMENT;
     std::scoped_lock lock(arena->mutation_mutex);
+    if (arena->access_poisoned.load()) {
+        last_error = "model arena retained after unproven access rollback";
+        return DDO_VMM_CUDA_ERROR;
+    }
     const size_t pages = execution_buffer_bytes / arena->page_size
         + (execution_buffer_bytes % arena->page_size != 0);
     const size_t budget_pages = arena->resident_budget / arena->page_size;
@@ -2828,6 +3097,10 @@ extern "C" int ddo_vmm_model_arena_record_compute(ddo_vmm_model_arena* arena, vo
 extern "C" int ddo_vmm_model_arena_wait_compute(ddo_vmm_model_arena* arena, void* stream) {
     if (!arena) return DDO_VMM_INVALID_ARGUMENT;
     std::scoped_lock lock(arena->mutation_mutex);
+    if (arena->access_poisoned.load()) {
+        last_error = "model arena retained after unproven access rollback";
+        return DDO_VMM_CUDA_ERROR;
+    }
     if (!arena->compute_fence_recorded) return DDO_VMM_SUCCESS;
     CUcontext temporary = nullptr;
     if (!activate_model_arena_context(arena, &temporary)) return DDO_VMM_CUDA_ERROR;
@@ -2843,6 +3116,10 @@ extern "C" int ddo_vmm_model_arena_wait_compute(ddo_vmm_model_arena* arena, void
 extern "C" int ddo_vmm_model_arena_drain_compute(ddo_vmm_model_arena* arena) {
     if (!arena) return DDO_VMM_INVALID_ARGUMENT;
     std::scoped_lock lock(arena->mutation_mutex);
+    if (arena->access_poisoned.load()) {
+        last_error = "model arena retained after unproven access rollback";
+        return DDO_VMM_CUDA_ERROR;
+    }
     if (!arena->compute_fence_recorded) return DDO_VMM_SUCCESS;
     CUcontext temporary = nullptr;
     if (!activate_model_arena_context(arena, &temporary)) return DDO_VMM_CUDA_ERROR;
@@ -2871,6 +3148,10 @@ extern "C" int ddo_vmm_execution_pool_create(ddo_vmm_model_arena* model,
                 capacity, model->page_size, model->backing_kind, &slot.arena);
             if (status != DDO_VMM_SUCCESS) {
                 return status;
+            }
+            {
+                std::scoped_lock arena_lock(slot.arena->mutation_mutex);
+                slot.arena->execution_slot = true;
             }
         }
         auto status = ddo_vmm_model_arena_enable_streaming(model, capacity * slot_count);

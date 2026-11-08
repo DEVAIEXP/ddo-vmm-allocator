@@ -9,6 +9,9 @@
 
 namespace {
 ddo_vmm_detail::MappingTrace trace;
+thread_local unsigned refused_access_calls = 0;
+thread_local CUresult injected_access_result = CUDA_ERROR_NOT_READY;
+thread_local bool access_refusal_armed_once = false;
 uint64_t ticks() noexcept {
     LARGE_INTEGER value{};
     return QueryPerformanceCounter(&value) ? static_cast<uint64_t>(value.QuadPart) : 0;
@@ -40,6 +43,17 @@ extern "C" int ddo_vmm_mapping_trace_start_v1(size_t capacity, size_t byte_limit
     return trace.start(capacity, byte_limit, identity);
 }
 extern "C" int ddo_vmm_mapping_trace_stop_v1() { return trace.stop(); }
+extern "C" __declspec(dllexport) int ddo_test_arm_access_refusal(unsigned calls) {
+    if (access_refusal_armed_once || calls < 1 || calls > 2) return 1;
+    access_refusal_armed_once = true;
+    refused_access_calls = calls;
+    return 0;
+}
+extern "C" __declspec(dllexport) int ddo_test_arm_access_oom() {
+    if (ddo_test_arm_access_refusal(1)) return 1;
+    injected_access_result = CUDA_ERROR_OUT_OF_MEMORY;
+    return 0;
+}
 extern "C" int ddo_vmm_mapping_trace_snapshot_v1(uint64_t* header, size_t count,
     ddo_vmm_mapping_record_v1* rows, size_t capacity) {
     return trace.snapshot(header, count, rows, capacity);
@@ -59,6 +73,17 @@ CUresult ddo_trace_mem_unmap(CUdeviceptr address, size_t bytes) {
 CUresult ddo_trace_mem_release(CUmemGenericAllocationHandle allocation) {
     auto row = record(3); row.allocation = allocation;
     return trace.measure(row, [&] { return cuMemRelease(allocation); }, ticks);
+}
+CUresult ddo_trace_mem_set_access(CUdeviceptr address, size_t bytes,
+    const CUmemAccessDesc* descriptors, size_t count) {
+    auto row = record(4); row.address = address; row.bytes = bytes;
+    return trace.measure(row, [&] {
+        if (refused_access_calls) {
+            --refused_access_calls;
+            return injected_access_result;
+        }
+        return cuMemSetAccess(address, bytes, descriptors, count);
+    }, ticks);
 }
 #else
 extern "C" int ddo_vmm_mapping_trace_start_v1(size_t, size_t) { return 2; }

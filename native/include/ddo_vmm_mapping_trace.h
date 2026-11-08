@@ -3,6 +3,7 @@
 
 // Internal diagnostic ABI, not a residency-control or physical-placement API.
 // Rows contain exactly 16 uint64 values. Result is the original driver status.
+// Actions: 1 map, 2 unmap, 3 release, 4 set access.
 struct ddo_vmm_mapping_record_v1 {
     uint64_t sequence, action, address, bytes, allocation, allocation_offset;
     uint64_t flags, result, begin_ticks, end_ticks, thread;

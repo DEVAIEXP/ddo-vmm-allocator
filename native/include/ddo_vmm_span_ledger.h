@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <iterator>
@@ -33,6 +34,45 @@ public:
         size_t mapped = 0, requested = 0, leased = 0, available = 0,
                pending = 0, quarantined = 0, live_count = 0, reserved_count = 0;
     };
+    struct Geometry {
+        uint64_t generation = 0;
+        size_t largest_available = 0, largest_reusable = 0,
+               available_runs = 0, reusable_runs = 0, spans = 0;
+        bool eligible = false, fits_available = false, fits_reusable = false,
+             whole_backing_releasable = false;
+    };
+
+    // CPU diagnostic prototype only. Pending intervals retain their fences;
+    // reusable is a virtual fit, not proof of completed work or physical headroom.
+    // Caller must hold its ledger lock and check context/retiring eligibility.
+    Geometry geometry(size_t requested, int device) const noexcept {
+        Geometry result;
+        result.generation = generation_;
+        result.whole_backing_releasable = releasable();
+        const auto size = aligned_size(requested);
+        result.eligible = !released_ && !release_pending_ && device == device_
+            && next_id_ != UINT64_MAX && size.has_value();
+        if (!result.eligible) return result;
+        size_t available = 0, reusable = 0, end = 0;
+        for (const auto& span : spans_) {
+            ++result.spans;
+            if (end != span.offset) { available = 0; reusable = 0; }
+            if (span.state == SpanState::available) {
+                if (!available) ++result.available_runs;
+                available += span.size;
+            } else available = 0;
+            if (span.state == SpanState::available || span.state == SpanState::pending) {
+                if (!reusable) ++result.reusable_runs;
+                reusable += span.size;
+            } else reusable = 0;
+            if (available > result.largest_available) result.largest_available = available;
+            if (reusable > result.largest_reusable) result.largest_reusable = reusable;
+            end = span.offset + span.size;
+        }
+        result.fits_available = result.largest_available >= *size;
+        result.fits_reusable = result.largest_reusable >= *size;
+        return result;
+    }
 
     SpanLedger(size_t mapped, int device, uint64_t generation)
         : mapped_(mapped), device_(device), generation_(generation) {
@@ -88,33 +128,27 @@ public:
         if (!size) return {};
         const auto [first, fit] = joined_run(*size);
         if (!fit) return {};
-        auto last = first;
-        size_t remaining = *size;
-        std::vector<SpanFenceOwner> dependencies;
-        for (;;) {
-            for (const auto& fence : last->dependencies) {
-                bool found = false;
-                for (const auto& retained : dependencies) found |= retained == fence;
-                if (!found) dependencies.push_back(fence);
-            }
-            if (remaining <= last->size) break;
-            remaining -= last->size;
-            ++last;
-        }
-        Lease lease{this, generation_, next_id_, first->offset, *size, requested, dependencies};
-        // Allocate/copy every replacement before touching the production list.
-        // Splice/erase then commit without throwing or losing a predecessor.
-        std::list<Span> replacement;
-        replacement.push_back({first->offset, *size, requested, next_id_,
-                               SpanState::reserved, std::move(dependencies)});
-        if (remaining < last->size)
-            replacement.push_back({last->offset + remaining, last->size - remaining,
-                                   0, 0, last->state, last->dependencies});
-        const auto after = std::next(last);
-        spans_.splice(first, replacement);
-        spans_.erase(first, after);
-        ++next_id_;
-        return lease;
+        return reserve_run(first, *size, requested);
+    }
+
+    // Growable shared owner placement: the lowest-address contiguous run of
+    // idle spans (available or pending, predecessor fences retained) that fits,
+    // so freed low space is reused before untouched VA at the end. Existing
+    // best-fit methods are unchanged and still used by every other owner.
+    std::optional<Lease> reserve_lowest(size_t requested, int device) {
+        if (released_ || release_pending_ || device != device_ || next_id_ == UINT64_MAX) return {};
+        const auto size = aligned_size(requested);
+        if (!size) return {};
+        const auto [first, fit] = lowest_run(*size);
+        if (!fit) return {};
+        return reserve_run(first, *size, requested);
+    }
+    std::optional<size_t> fit_size_lowest(size_t requested, int device) const {
+        if (released_ || release_pending_ || device != device_ || next_id_ == UINT64_MAX) return {};
+        const auto size = aligned_size(requested);
+        if (!size) return {};
+        const auto fit = lowest_run(*size).second;
+        return fit ? std::optional<size_t>(fit) : std::nullopt;
     }
 
     std::optional<size_t> fit_size_joined(size_t requested, int device) const {
@@ -130,6 +164,24 @@ public:
         std::vector<SpanFenceOwner> result;
         for (const auto& span : spans_) {
             if (span.state != SpanState::pending) continue;
+            for (const auto& fence : span.dependencies) {
+                bool found = false;
+                for (const auto& existing : result) found |= existing == fence;
+                if (!found) result.push_back(fence);
+            }
+        }
+        return result;
+    }
+
+    // Distinct fences of pending spans intersecting one range. Empty when the
+    // range is invalid. Read-only; the caller must hold the ledger lock.
+    std::vector<SpanFenceOwner> range_pending_fences(size_t offset, size_t bytes) const {
+        std::vector<SpanFenceOwner> result;
+        if (released_ || release_pending_ || offset > mapped_ || bytes > mapped_ - offset) return result;
+        const auto end = offset + bytes;
+        for (const auto& span : spans_) {
+            if (span.state != SpanState::pending) continue;
+            if (span.offset + span.size <= offset || span.offset >= end) continue;
             for (const auto& fence : span.dependencies) {
                 bool found = false;
                 for (const auto& existing : result) found |= existing == fence;
@@ -221,12 +273,63 @@ public:
         return result;
     }
 
+    // Candidate-only physical accounting: clip states to one resident unit.
+    // Requested bytes/counts remain whole-lease gauges in snapshot().
+    std::optional<Snapshot> range_snapshot(size_t offset, size_t bytes) const {
+        if (released_ || offset > mapped_ || bytes > mapped_ - offset) return {};
+        Snapshot result; result.mapped = bytes;
+        if (release_pending_) { result.pending = bytes; return result; }
+        const auto end = offset + bytes;
+        for (const auto& span : spans_) {
+            const auto left = std::max(offset, span.offset);
+            const auto right = std::min(end, span.offset + span.size);
+            if (left >= right) continue;
+            const auto size = right - left;
+            switch (span.state) {
+            case SpanState::reserved: case SpanState::live: result.leased += size; break;
+            case SpanState::available: result.available += size; break;
+            case SpanState::pending: result.pending += size; break;
+            case SpanState::quarantined: result.quarantined += size; break;
+            }
+        }
+        if (result.leased + result.available + result.pending + result.quarantined != bytes) return {};
+        return result;
+    }
+
+    // Read-only proof under the same external serialization as reserve/retire.
+    // A byte total is insufficient: every intersecting span must be available.
+    bool dead_range(size_t offset, size_t bytes, int device, uint64_t generation) const {
+        if (released_ || release_pending_ || device != device_ || generation != generation_
+            || !bytes || offset > mapped_ || bytes > mapped_ - offset) return false;
+        const auto end = offset + bytes;
+        size_t cursor = offset;
+        for (const auto& span : spans_) {
+            const auto right = span.offset + span.size;
+            if (right <= offset || span.offset >= end) continue;
+            if (span.offset > cursor || span.state != SpanState::available
+                || !span.dependencies.empty()) return false;
+            cursor = right < end ? right : end;
+        }
+        return cursor == end;
+    }
+
+    bool owns_reservation(const Lease& lease, int device) const {
+        if (released_ || release_pending_ || device != device_ || lease.owner != this || lease.generation != generation_)
+            return false;
+        for (const auto& span : spans_)
+            if (span.state == SpanState::reserved && span.id == lease.id
+                && span.offset == lease.offset && span.size == lease.size
+                && span.requested == lease.requested) return true;
+        return false;
+    }
+
     bool releasable() const {
         if (released_ || release_pending_) return false;
         for (const auto& span : spans_)
             if (span.state != SpanState::available || !span.dependencies.empty()) return false;
         return true;
     }
+    bool release_claimed() const { return release_pending_ && !released_; }
     // Reserve ownership under the caller's lock; actual native destruction
     // happens outside it. No new allocation can enter while release is pending.
     bool begin_backing_release() {
@@ -281,6 +384,56 @@ private:
             if (it->id == lease.id && it->offset == lease.offset && it->size == lease.size
                 && it->requested == lease.requested && it->state == state) return it;
         return spans_.end();
+    }
+    // Commit a reservation of `size` bytes starting at `first`, a run of idle
+    // spans already proven to cover it. Shared by joined and lowest placement.
+    std::optional<Lease> reserve_run(std::list<Span>::const_iterator first_const, size_t size,
+                                     size_t requested) {
+        auto first = spans_.erase(first_const, first_const); // const_iterator -> iterator.
+        auto last = first;
+        size_t remaining = size;
+        std::vector<SpanFenceOwner> dependencies;
+        for (;;) {
+            for (const auto& fence : last->dependencies) {
+                bool found = false;
+                for (const auto& retained : dependencies) found |= retained == fence;
+                if (!found) dependencies.push_back(fence);
+            }
+            if (remaining <= last->size) break;
+            remaining -= last->size;
+            ++last;
+        }
+        Lease lease{this, generation_, next_id_, first->offset, size, requested, dependencies};
+        // Allocate/copy every replacement before touching the production list.
+        // Splice/erase then commit without throwing or losing a predecessor.
+        std::list<Span> replacement;
+        replacement.push_back({first->offset, size, requested, next_id_,
+                               SpanState::reserved, std::move(dependencies)});
+        if (remaining < last->size)
+            replacement.push_back({last->offset + remaining, last->size - remaining,
+                                   0, 0, last->state, last->dependencies});
+        const auto after = std::next(last);
+        spans_.splice(first, replacement);
+        spans_.erase(first, after);
+        ++next_id_;
+        return lease;
+    }
+
+    // Lowest-address contiguous run of idle spans covering size.
+    auto lowest_run(size_t size) const
+        -> std::pair<std::list<Span>::const_iterator, size_t> {
+        auto first = spans_.end();
+        size_t total = 0, end = 0;
+        for (auto it = spans_.begin(); it != spans_.end(); ++it) {
+            if (it->state != SpanState::available && it->state != SpanState::pending) {
+                first = spans_.end(); total = 0; continue;
+            }
+            if (first == spans_.end() || end != it->offset) { first = it; total = 0; }
+            total += it->size;
+            end = it->offset + it->size;
+            if (total >= size) return {first, total};
+        }
+        return {spans_.end(), 0};
     }
     auto joined_run(size_t size) const
         -> std::pair<std::list<Span>::const_iterator, size_t> {
