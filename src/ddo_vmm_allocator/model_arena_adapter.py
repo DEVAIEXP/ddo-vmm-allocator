@@ -184,6 +184,27 @@ def inspect_model_linear_layout(root, module_pattern: str = ".*") -> dict[str, A
     }
 
 
+def estimate_execution_slot_bytes(root, module_pattern: str = ".*", *,
+                                  granularity_bytes: int = 2 * 1024**2) -> int:
+    """One execution slot for ``root`` at the configured unit level (CPU metadata only).
+
+    Uses the attachment's selector, unit grouping and per-tensor 512-byte slot
+    alignment, rounded up to ``granularity_bytes``; streaming attachment needs
+    two such slots inside the residency ceiling. No CUDA, DLL or model change.
+    """
+    if granularity_bytes <= 0:
+        raise ValueError("granularity_bytes must be positive")
+    selected, units, _ = _discover_linear_layout(root, module_pattern)
+    sizes: dict[str, int] = {}
+    for name, module in selected:
+        unit = units[name][0] if name in units else name
+        for _key, parameter in _layout_parameter_items(module):
+            size = sizes.get(unit, 0)
+            sizes[unit] = ((size + 511) & ~511) + parameter.numel() * parameter.element_size()
+    maximum = max(sizes.values(), default=0)
+    return -(-maximum // granularity_bytes) * granularity_bytes
+
+
 def _layout_parameter_items(module, auxiliary_groups=None):
     """Legacy Linear geometry, extended only by explicit auxiliary ownership."""
     import torch

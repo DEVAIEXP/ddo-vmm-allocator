@@ -138,6 +138,26 @@ def test_sub_block_detection_is_structural():
     assert adapter_module._has_sub_block_units(root, []) is False
 
 
+def test_execution_slot_estimate_matches_attachment_unit_sizes(monkeypatch):
+    root = model()
+    block_slot = adapter_module.estimate_execution_slot_bytes(root, granularity_bytes=512)
+    _, block_units, _ = attach(root, _discover_linear_layout(root, r".*"), monkeypatch)
+    assert block_slot == -(-max(unit_sizes(block_units)) // 512) * 512
+    configure_experimental_execution_unit_level("block_child")
+    root2 = model()
+    child_slot = adapter_module.estimate_execution_slot_bytes(root2, granularity_bytes=512)
+    adapter, child_units, _ = attach(root2, _discover_linear_layout(root2, r".*"), monkeypatch)
+    try:
+        assert child_slot == -(-max(unit_sizes(child_units)) // 512) * 512
+        assert child_slot < block_slot
+        assert adapter_module.estimate_execution_slot_bytes(root2) % (2 * 1024**2) == 0
+    finally:
+        for handle in adapter._handles:
+            handle.remove()
+    with pytest.raises(ValueError):
+        adapter_module.estimate_execution_slot_bytes(root2, granularity_bytes=0)
+
+
 def states(count):
     return [SimpleNamespace(name=str(i)) for i in range(count)]
 
