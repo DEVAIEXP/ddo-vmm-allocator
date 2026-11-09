@@ -102,6 +102,9 @@ struct ddo_vmm_source_cache {
     bool pressure_suspended = false;
     bool model_windows = false;
     bool persistent_buffer = false;
+    // Source-only dispatcher selected for this cache: requires the dispatcher
+    // build and a persistent buffer; may be disabled before the first request.
+    bool dispatcher = false;
     uint64_t registered_limit = 0;
     std::vector<ddo_vmm_source_ticket*> transfers;
     std::vector<std::shared_ptr<Entry>> entries;
@@ -592,6 +595,7 @@ extern "C" ddo_vmm_status ddo_vmm_source_cache_create(
         cache->host_headroom = config->host_headroom_bytes;
         cache->model_windows = config->version >= 4;
         cache->persistent_buffer = config->version == 5;
+        cache->dispatcher = cache->persistent_buffer && ddo_vmm_source_dispatcher_enabled() != 0;
         cache->registered_limit = registered_limit;
         cache->entries.reserve(config->slot_count);
         AggregateLease aggregate_lease{cache.get()};
@@ -697,7 +701,7 @@ static ddo_vmm_status cache_request_impl(
             cache->stats.retained_bytes += fill_size;
 #if defined(_WIN32) || defined(__linux__)
 #if defined(DDO_VMM_NATIVE_SOURCE_DISPATCHER)
-            if (cache->persistent_buffer) status = schedule_read(cache, found, demand);
+            if (cache->dispatcher) status = schedule_read(cache, found, demand);
             else
 #endif
             status = ddo_source_io::read_source_async(cache->ring, found->slot, found->source, fill_offset, fill_size);
@@ -710,7 +714,7 @@ static ddo_vmm_status cache_request_impl(
         } else {
             ++cache->stats.hits;
 #if defined(DDO_VMM_NATIVE_SOURCE_DISPATCHER)
-            if (cache->persistent_buffer) {
+            if (cache->dispatcher) {
                 status = schedule_read(cache, found, demand);
                 if (status != DDO_VMM_SUCCESS) { ++cache->stats.bypasses; return status; }
             }
@@ -740,6 +744,21 @@ extern "C" int ddo_vmm_source_dispatcher_enabled(void) {
 #endif
 }
 
+extern "C" ddo_vmm_status ddo_vmm_source_cache_select_dispatcher(ddo_vmm_source_cache* cache, int enabled) {
+    return boundary([&]() -> ddo_vmm_status {
+        if (!cache || (enabled != 0 && enabled != 1))
+            return failure(DDO_VMM_INVALID_ARGUMENT, "live cache and a 0/1 dispatcher selection required");
+        std::lock_guard<std::mutex> lock(cache->mutex);
+        // Cold selection only: no entry, scheduler or dispatcher thread may exist.
+        if (!cache->entries.empty() || cache->read_scheduler || cache->read_dispatcher.joinable())
+            return failure(DDO_VMM_BUSY, "dispatcher selection must precede the first cache request");
+        if (enabled && !(cache->persistent_buffer && ddo_vmm_source_dispatcher_enabled()))
+            return failure(DDO_VMM_UNSUPPORTED, "source-only dispatcher requires its build and a persistent buffer");
+        cache->dispatcher = enabled != 0;
+        return DDO_VMM_SUCCESS;
+    });
+}
+
 extern "C" ddo_vmm_status ddo_vmm_source_dispatcher_snapshot(
     ddo_vmm_source_cache* cache, size_t* owned, size_t* peak, size_t* limit) {
     return boundary([&]() -> ddo_vmm_status {
@@ -756,7 +775,7 @@ extern "C" ddo_vmm_status ddo_vmm_source_dispatcher_snapshot(
 extern "C" ddo_vmm_status ddo_vmm_source_batch_prepare(ddo_vmm_source_batch* batch) {
     return boundary([&]() -> ddo_vmm_status {
         if (!batch) return failure(DDO_VMM_INVALID_ARGUMENT, "live immutable batch required");
-        if (!ddo_vmm_source_dispatcher_enabled() || !batch->cache->persistent_buffer)
+        if (!batch->cache->dispatcher)
             return failure(DDO_VMM_UNSUPPORTED, "source-only dispatcher is not enabled");
         auto* cache = batch->cache;
         auto status = context_check(cache);

@@ -20,6 +20,25 @@ _PRESSURE_FIELDS = (
 )
 
 
+_source_dispatcher_selected = True
+
+
+def configure_source_dispatcher(enabled: bool) -> None:
+    """Select the source-only dispatcher for later persistent caches.
+
+    ``True`` (default) uses it when the native build provides it; ``False``
+    uses direct ring reads. Existing caches keep their selection.
+    """
+    global _source_dispatcher_selected
+    if not isinstance(enabled, bool):
+        raise TypeError("enabled must be a bool")
+    _source_dispatcher_selected = enabled
+
+
+def source_dispatcher_selected() -> bool:
+    return _source_dispatcher_selected
+
+
 def _pressure_snapshot(dll, handle, check):
     """Older binaries omit observations rather than reporting invented zeros."""
     snapshot = getattr(dll, "ddo_vmm_source_cache_pressure_snapshot_v1", None)
@@ -186,10 +205,24 @@ class NativeSourceCache:
                 self.source_dispatcher = bool(capability())
         except AttributeError as error:
             raise NativeVmmError("DLL lacks the experimental source cache; rebuild allocator") from error
+        # A dispatcher build selects the dispatcher for persistent caches; the
+        # process-level selection may only turn it off, before any request.
+        disable_dispatcher = self.source_dispatcher and not _source_dispatcher_selected
+        select = getattr(self._dll, "ddo_vmm_source_cache_select_dispatcher", None)
+        if disable_dispatcher and select is None:
+            raise NativeVmmError("this dispatcher build cannot disable the source dispatcher; rebuild allocator")
         config_version = 5 if persistent_buffer else 4 if model_windows else 3 if process_limit_bytes > 128 * 2**20 else 2
         config = _Config(c.sizeof(_Config), config_version, device, slots, slot_bytes, host_headroom_bytes,
                          process_limit_bytes, registered_limit_bytes)
         self._check(self._dll.ddo_vmm_source_cache_create(c.byref(config), c.byref(self._handle)))
+        if disable_dispatcher:
+            select.argtypes, select.restype = [c.c_void_p, c.c_int], c.c_int
+            status = select(self._handle, 0)
+            if status:
+                error = self._dll.ddo_vmm_source_cache_last_error()
+                self._dll.ddo_vmm_source_cache_close(c.byref(self._handle))
+                raise NativeSourceError(status, error.decode("utf-8", errors="replace") if error else f"cache status {status}")
+            self.source_dispatcher = False
 
     def _check(self, status):
         if status:

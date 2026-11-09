@@ -213,6 +213,11 @@ DDO_VMM_API ddo_vmm_status ddo_vmm_source_batch_create(
  * or explicit read-completion wait. Existing admission/pressure guards apply.
  * Available only in the isolated native-source-dispatcher build. */
 DDO_VMM_API int ddo_vmm_source_dispatcher_enabled(void);
+/** Cold per-cache selection (0/1) before the first request. A persistent cache
+ * in a dispatcher build selects it by default; 0 uses the direct ring reads of
+ * builds without it. Enabling it elsewhere returns UNSUPPORTED; after a request
+ * (until clear) BUSY. Changes no capacity, admission or ownership. */
+DDO_VMM_API ddo_vmm_status ddo_vmm_source_cache_select_dispatcher(ddo_vmm_source_cache* cache, int enabled);
 /** Optional CPU-only metadata snapshot: owned windows, peak since clear and
  * dispatcher limit. Counts include completed reads awaiting retirement. */
 DDO_VMM_API ddo_vmm_status ddo_vmm_source_dispatcher_snapshot(
