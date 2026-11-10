@@ -198,6 +198,17 @@ void publish_capacity_report(const CapacityReport& r) {
         v(r.t1_excluded), v(r.t2_evictable), v(r.t2_busy_arenas), v(r.t2_evictions), v(r.t2_bytes),
         v(r.t2_status), v(r.t3_status), v(r.t3_fences), v(r.t3_released), v(r.retry_status),
         v(r.termination), v(unobserved));
+    if (r.termination == term_satisfied) {
+        std::fprintf(stderr,
+            "DDO allocation recovery: status=recovered requested_bytes=%llu; "
+            "allocation succeeded after releasing unused GPU backing; execution can continue.\n",
+            v(r.request_bytes));
+    } else {
+        std::fprintf(stderr,
+            "DDO allocation recovery: status=failed requested_bytes=%llu termination=%llu; "
+            "allocation was not satisfied; see the capacity transaction details above.\n",
+            v(r.request_bytes), v(r.termination));
+    }
     std::fflush(stderr);
 }
 #ifdef DDO_VMM_TIMING_COUNTERS

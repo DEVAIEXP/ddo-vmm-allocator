@@ -1,5 +1,14 @@
 # Validation
 
+## Allocation recovery diagnostics
+
+The segmented pool writes allocation-pressure diagnostics to stderr. An initial
+Driver or materialization refusal can be recovered by the capacity transaction.
+Its final summary distinguishes `status=recovered` (the allocation succeeded and
+execution can continue) from `status=failed` (the allocation was not satisfied).
+The preceding detailed record preserves the original Driver statuses and page
+counts. A recovered allocation does not certify the rest of the inference.
+
 ## Execution backing integration: selected Windows lifecycle acceptance
 
 The optional execution-slot reclaim integration adds CPU contracts for pending
