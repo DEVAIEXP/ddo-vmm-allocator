@@ -117,6 +117,73 @@ def test_native_assembly_requires_paired_selection(tmp_path, monkeypatch, variab
         build_hook(tmp_path).initialize("standard", {})
 
 
+def bridge_files(tmp_path, **overrides):
+    module = tmp_path / "ddo_vmm_torch_bridge.cp312-win_amd64.pyd"
+    module.write_bytes(pe_bytes())
+    identity = {"abi": 1, "torch_version": "2.12.1+cu132", "torch_git": "7269437", "python": "cp312",
+                "platform": "win32", "module": module.name, "sha256": hashlib.sha256(pe_bytes()).hexdigest()}
+    identity.update(overrides)
+    path = tmp_path / "bridge.json"
+    path.write_text(json.dumps(identity))
+    return module, path
+
+
+def select_native(tmp_path, monkeypatch):
+    binary = tmp_path / "existing.dll"
+    binary.write_bytes(pe_bytes())
+    monkeypatch.setenv("DDO_VMM_WHEEL_LIBRARY", str(binary))
+    monkeypatch.setenv("DDO_VMM_WHEEL_SHA256", hashlib.sha256(pe_bytes()).hexdigest())
+    monkeypatch.delenv("DDO_VMM_WHEEL_ABI_REPORT", raising=False)
+
+
+def test_windows_wheel_includes_a_hash_selected_torch_bridge(tmp_path, monkeypatch):
+    select_native(tmp_path, monkeypatch)
+    module, identity = bridge_files(tmp_path)
+    monkeypatch.setenv("DDO_VMM_WHEEL_TORCH_BRIDGE", str(module))
+    monkeypatch.setenv("DDO_VMM_WHEEL_TORCH_BRIDGE_IDENTITY", str(identity))
+    builder, data = build_hook(tmp_path), {}
+    try:
+        builder.initialize("standard", data)
+        sources = {destination: Path(source) for source, destination in data["force_include"].items()}
+        assert sources[f"ddo_vmm_allocator/native/win32/{module.name}"].read_bytes() == pe_bytes()
+        recorded = json.loads(sources["ddo_vmm_allocator/native/win32/ddo_vmm_torch_bridge.json"].read_text())
+        assert recorded["torch_git"] == "7269437" and recorded["module"] == module.name
+    finally:
+        builder.finalize("standard", data, "unused.whl")
+
+
+def test_windows_wheel_without_bridge_selection_is_unchanged(tmp_path, monkeypatch):
+    select_native(tmp_path, monkeypatch)
+    monkeypatch.delenv("DDO_VMM_WHEEL_TORCH_BRIDGE", raising=False)
+    monkeypatch.delenv("DDO_VMM_WHEEL_TORCH_BRIDGE_IDENTITY", raising=False)
+    builder, data = build_hook(tmp_path), {}
+    try:
+        builder.initialize("standard", data)
+        assert sorted(data["force_include"].values()) == ["ddo_vmm_allocator/native/win32/artifact.json",
+                                                          "ddo_vmm_allocator/native/win32/ddo_vmm.dll"]
+    finally:
+        builder.finalize("standard", data, "unused.whl")
+
+
+@pytest.mark.parametrize("overrides, only", [({"sha256": "0" * 64}, None), ({"torch_git": ""}, None),
+                                             ({"module": "other.pyd"}, None), ({}, "module"), ({}, "identity")])
+def test_torch_bridge_selection_is_refused_when_incomplete_or_mismatched(tmp_path, monkeypatch, overrides, only):
+    select_native(tmp_path, monkeypatch)
+    module, identity = bridge_files(tmp_path, **overrides)
+    monkeypatch.setenv("DDO_VMM_WHEEL_TORCH_BRIDGE", str(module))
+    monkeypatch.setenv("DDO_VMM_WHEEL_TORCH_BRIDGE_IDENTITY", str(identity))
+    if only == "module":
+        monkeypatch.delenv("DDO_VMM_WHEEL_TORCH_BRIDGE_IDENTITY")
+    if only == "identity":
+        monkeypatch.delenv("DDO_VMM_WHEEL_TORCH_BRIDGE")
+    builder = build_hook(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            builder.initialize("standard", {})
+    finally:
+        builder.finalize("standard", {}, "unused.whl")
+
+
 def test_native_assembly_snapshots_binary_and_records_platform(tmp_path, monkeypatch):
     binary = tmp_path / "existing.dll"
     original = pe_bytes()

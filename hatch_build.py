@@ -50,6 +50,31 @@ def validate_linux_artifact(path: Path, expected_sha256: str) -> str:
     return actual
 
 
+TORCH_BRIDGE_FIELDS = ("abi", "torch_version", "torch_git", "python", "platform", "module", "sha256")
+
+
+def validate_torch_bridge(module_path: Path, identity_path: Path) -> dict:
+    """Check the optional Windows Torch bridge against its identity without loading it.
+
+    The identity must name the module file and record its SHA256 and the exact
+    PyTorch/CPython build it was compiled against; the installer uses the bridge
+    only on that exact match at runtime.
+    """
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    missing = [field for field in TORCH_BRIDGE_FIELDS if not identity.get(field)]
+    if missing:
+        raise ValueError(f"Torch bridge identity lacks {missing}")
+    if identity["platform"] != "win32" or not str(identity["module"]).endswith("-win_amd64.pyd"):
+        raise ValueError("The Torch bridge is assembled for Windows AMD64 only")
+    if module_path.name != identity["module"]:
+        raise ValueError("Torch bridge file name does not match its identity")
+    data = module_path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != str(identity["sha256"]).lower():
+        raise ValueError("Torch bridge SHA256 does not match its identity; refusing to package")
+    validate_windows_artifact(module_path, hashlib.sha256(data).hexdigest())
+    return identity
+
+
 class CustomBuildHook(BuildHookInterface):
     """Plain wheels stay pure; explicit native builds get a platform tag."""
 
@@ -96,6 +121,24 @@ class CustomBuildHook(BuildHookInterface):
         includes = build_data.setdefault("force_include", {})
         includes[str(binary)] = f"ddo_vmm_allocator/native/{directory}/{filename}"
         includes[str(manifest)] = f"ddo_vmm_allocator/native/{directory}/artifact.json"
+        # Optional checked Torch bridge: both paths or neither; never compiled here.
+        bridge = os.environ.get("DDO_VMM_WHEEL_TORCH_BRIDGE")
+        bridge_identity = os.environ.get("DDO_VMM_WHEEL_TORCH_BRIDGE_IDENTITY")
+        if bridge or bridge_identity:
+            if not bridge or not bridge_identity:
+                raise ValueError("Torch bridge assembly requires both DDO_VMM_WHEEL_TORCH_BRIDGE and "
+                                 "DDO_VMM_WHEEL_TORCH_BRIDGE_IDENTITY")
+            if platform_tag != "win_amd64":
+                raise ValueError("The Torch bridge is assembled for Windows AMD64 wheels only")
+            bridge_path = Path(bridge).expanduser().resolve(strict=True)
+            identity = validate_torch_bridge(bridge_path, Path(bridge_identity).expanduser().resolve(strict=True))
+            bridge_copy = stage / identity["module"]
+            bridge_copy.write_bytes(bridge_path.read_bytes())
+            identity_copy = stage / "ddo_vmm_torch_bridge.json"
+            identity_copy.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+            validate_torch_bridge(bridge_copy, identity_copy)
+            includes[str(bridge_copy)] = f"ddo_vmm_allocator/native/{directory}/{identity['module']}"
+            includes[str(identity_copy)] = f"ddo_vmm_allocator/native/{directory}/ddo_vmm_torch_bridge.json"
 
     def finalize(self, version, build_data, artifact_path):
         stage = getattr(self, "_staging", None)

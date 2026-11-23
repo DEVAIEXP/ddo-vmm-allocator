@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
+import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +28,100 @@ GROWABLE_RESERVE_ENVIRONMENT = "DDO_VMM_GROWABLE_RESERVE_BYTES"
 MAX_GROWABLE_RESERVE_BYTES = 64 * 1024**3
 _POOL_CONFIGURATION_EXPORTS = ("ddo_exp_segmented_configure_auto", "ddo_exp_segmented_configure_growable")
 
+# Optional Torch-version-specific checked registration (native/torch_bridge).
+# "auto" uses it only on an exact identity match, "0" never, "1" requires it.
+TORCH_BRIDGE_ENVIRONMENT = "DDO_VMM_TORCH_BRIDGE"
+TORCH_BRIDGE_IDENTITY = "ddo_vmm_torch_bridge.json"
+TORCH_BRIDGE_ABI = 1
+_allocation_boundary: str | None = None
+
 
 def installed_library_path() -> Path | None:
     """Actual installed allocator library, not a mutable environment setting."""
     return _installed_library_path
+
+
+def installed_allocation_boundary() -> str | None:
+    """``"checked"`` when a final native refusal raises in PyTorch, ``"unguarded"``
+    when the plain pluggable allocator is used, ``None`` before installation."""
+    return _allocation_boundary
+
+
+def _torch_bridge_mode() -> str:
+    value = os.environ.get(TORCH_BRIDGE_ENVIRONMENT, "").strip().lower() or "auto"
+    if value not in ("auto", "0", "1"):
+        raise TorchAllocatorInstallError(f"{TORCH_BRIDGE_ENVIRONMENT} must be auto, 0 or 1, got {value!r}")
+    return value
+
+
+def _load_torch_bridge(torch: Any, library_path: Path, mode: str) -> Any | None:
+    """Load the checked bridge next to the native library on an exact identity match.
+
+    Without an identity file, or for another PyTorch/CPython build, the plain
+    pluggable allocator stays in use (``mode="1"`` refuses instead). A matching
+    identity whose module bytes differ is a damaged installation and is refused.
+    """
+    if mode == "0":
+        return None
+    identity_path = library_path.parent / TORCH_BRIDGE_IDENTITY
+    if not identity_path.is_file():
+        if mode == "1":
+            raise TorchAllocatorInstallError(f"{TORCH_BRIDGE_ENVIRONMENT}=1 but no bridge identity at {identity_path}")
+        return None
+    try:
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise TorchAllocatorInstallError(f"unreadable Torch bridge identity {identity_path}") from error
+    expected = {
+        "abi": TORCH_BRIDGE_ABI,
+        "torch_version": torch.__version__,
+        "torch_git": getattr(torch.version, "git_version", None),
+        "python": f"cp{sys.version_info.major}{sys.version_info.minor}",
+        "platform": sys.platform,
+    }
+    mismatched = sorted(key for key, value in expected.items() if identity.get(key) != value)
+    if mismatched:
+        if mode == "1":
+            raise TorchAllocatorInstallError(f"Torch bridge identity does not match this process: {mismatched}")
+        return None
+    module_path = library_path.parent / str(identity.get("module", ""))
+    if not module_path.is_file():
+        raise TorchAllocatorInstallError(f"Torch bridge module missing: {module_path}")
+    digest = hashlib.sha256(module_path.read_bytes()).hexdigest()
+    if digest != identity.get("sha256"):
+        raise TorchAllocatorInstallError(f"Torch bridge module hash mismatch: {module_path}")
+    spec = importlib.util.spec_from_file_location("ddo_vmm_torch_bridge", module_path)
+    if spec is None or spec.loader is None:
+        raise TorchAllocatorInstallError(f"cannot load Torch bridge module {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if getattr(module, "BRIDGE_ABI", None) != TORCH_BRIDGE_ABI:
+        raise TorchAllocatorInstallError("Torch bridge ABI mismatch")
+    return module
+
+
+def _register_allocator(torch: Any, library: Any, path: Path, bridge: Any | None) -> tuple[Any, str]:
+    """Register the already-loaded native callbacks with PyTorch.
+
+    The plain path is PyTorch's own ``CUDAPluggableAllocator``. The checked
+    path registers the same exports of the same loaded module through
+    ``createCustomAllocator`` and only adds the null-result exception.
+    """
+    if bridge is None:
+        allocator = torch.cuda.memory.CUDAPluggableAllocator(
+            str(path), "ddo_vmm_torch_malloc", "ddo_vmm_torch_free"
+        )
+        torch.cuda.memory.change_current_allocator(allocator)
+        return allocator, "unguarded"
+    import ctypes
+
+    def address(name: str) -> int:
+        function = getattr(library, name, None)
+        return 0 if function is None else int(ctypes.cast(function, ctypes.c_void_p).value or 0)
+
+    bridge.install(address("ddo_vmm_torch_malloc"), address("ddo_vmm_torch_free"),
+                   address("ddo_exp_segmented_last_refusal"))
+    return bridge, "checked"
 
 
 def installed_pool_configuration() -> dict[str, Any]:
@@ -111,7 +205,7 @@ def install_pytorch_vmm_allocator(
     library built with the segmented pool features; it is never ignored.
     """
 
-    global _installed_allocator, _installed_library_path, _configured_library
+    global _installed_allocator, _installed_library_path, _configured_library, _allocation_boundary
     if _installed_allocator is not None:
         return _installed_allocator
 
@@ -122,6 +216,7 @@ def install_pytorch_vmm_allocator(
         )
     path = Path(resolved_path).expanduser().resolve(strict=True)
     auto, reserve = _resolve_pool_configuration(segmented_auto, growable_reserve_bytes)
+    bridge_mode = _torch_bridge_mode()
     if show_recovery_warns is None:
         show_recovery_warns = bool(_environment_flag("DDO_SHOW_RECOVERY_WARNS"))
     if type(show_recovery_warns) is not bool:
@@ -153,13 +248,13 @@ def install_pytorch_vmm_allocator(
             "CUDA is already initialized; start a fresh process through the DDO VMM launcher"
         )
 
+    # Load (but do not install) the optional bridge before mutating native state.
+    bridge = _load_torch_bridge(torch, path, bridge_mode)
     _apply_pool_configuration(library, auto, reserve)
-    allocator = torch.cuda.memory.CUDAPluggableAllocator(
-        str(path), "ddo_vmm_torch_malloc", "ddo_vmm_torch_free"
-    )
-    torch.cuda.memory.change_current_allocator(allocator)
+    allocator, boundary = _register_allocator(torch, library, path, bridge)
     _configured_library = library
     _pool_configuration.update(segmented_auto=auto, growable_reserve_bytes=reserve)
     _installed_allocator = allocator
     _installed_library_path = path
+    _allocation_boundary = boundary
     return allocator

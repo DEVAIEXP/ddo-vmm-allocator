@@ -34,6 +34,15 @@ Python/Torch-specific wheel multiplication unless the actual native ABI requires
 Maintain reviewed DDO adapter/allocator API pairings. Tags, push, registry upload
 and promotion are explicit release actions, never implicit documentation tasks.
 
+A Windows wheel can also include the optional checked PyTorch allocation bridge:
+set both `DDO_VMM_WHEEL_TORCH_BRIDGE` (the built `.pyd`) and
+`DDO_VMM_WHEEL_TORCH_BRIDGE_IDENTITY` (its JSON identity: abi, torch_version,
+torch_git, python, platform, module, sha256). The hook verifies the module name,
+SHA256 and PE architecture, snapshots both into `native/win32/` and never builds
+or loads them. Without these variables Windows wheels are unchanged. The module
+is specific to one PyTorch build and CPython ABI; other environments keep the
+plain allocator registration at runtime.
+
 ## Linux candidate assembly
 The same paired `DDO_VMM_WHEEL_LIBRARY` / `DDO_VMM_WHEEL_SHA256` selection accepts
 ELF64 little-endian x86-64 shared objects. It snapshots the verified bytes under

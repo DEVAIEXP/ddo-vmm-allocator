@@ -25,6 +25,14 @@ have different features, so do not assume this Linux recipe reproduces them.
 It does not enable recording automatically; use a separate candidate directory.
 Its internal ABI is not a supported Python residency-control interface.
 
+The optional checked PyTorch bridge is a separate CMake project in
+`native/torch_bridge` (MSVC Windows x64). Configure a new candidate directory
+with `-DDDO_VMM_BUILD_TORCH_BRIDGE=ON` and explicit `TORCH_ROOT` (the target
+environment's `site-packages/torch`), `PYTHON_ROOT`, `PYTHON_LIBRARY` and
+`CUDA_ROOT` (headers only). It always builds `checked_allocation_cpu`, a CPU
+policy test without Torch or CUDA. Record the Torch version/git revision,
+CPython tag, toolchain and module SHA256 in its identity JSON.
+
 Build helpers have fixed paths: inspect before running. Record source revision/
 dirty state, features, compiler/toolkit, architecture, exports, dependencies and hash.
 Do not bundle host NVIDIA drivers. WSL cannot necessarily load a newer native-Linux

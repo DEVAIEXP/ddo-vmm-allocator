@@ -12,6 +12,26 @@ Invalid flag values are refused without changing the previous value. Libraries
 without this export preserve their existing behavior; bindings report control
 as unavailable rather than claiming that old binaries were silenced.
 
+## Checked PyTorch allocation boundary
+
+PyTorch's `CUDAPluggableAllocator` publishes a null pointer returned by the
+native allocator as tensor storage without raising, so a final allocation
+refusal surfaces later as an illegal memory access. The optional Windows
+module `native/torch_bridge` (a separate Torch-linked project, never part of
+the Driver-only library) registers the same `ddo_vmm_torch_malloc`/`free`
+exports of the already-loaded library through `createCustomAllocator`; it does
+not load the library itself. Successful pointers and frees pass unchanged.
+A null result never reaches PyTorch: when `ddo_exp_segmented_last_refusal`
+reports a capacity transaction for the same request with termination 2, 3, 4
+or 8 it raises `torch.OutOfMemoryError` with the requested size and
+termination; any other null (completion/driver errors, rollback retention,
+no matching report) raises `RuntimeError` without claiming out-of-memory.
+The installer uses the module only when `ddo_vmm_torch_bridge.json` next to the
+library matches the running PyTorch version and git revision, CPython tag,
+platform and module SHA256; otherwise the plain `CUDAPluggableAllocator` path
+is used unchanged. `DDO_VMM_TORCH_BRIDGE=0` disables it, `=1` requires it.
+`installed_allocation_boundary()` reports `checked` or `unguarded`.
+
 ## Optional execution-slot backing reclaim
 
 Execution pools expose additive `reclaim_idle`, `configure_reclaim` and
