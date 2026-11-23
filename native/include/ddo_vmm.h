@@ -562,6 +562,12 @@ DDO_VMM_API ddo_vmm_status ddo_vmm_dxgi_budget_guard_set(
     uint64_t system_headroom_bytes
 );
 DDO_VMM_API const char* ddo_vmm_last_error(void);
+/** Optional process-wide recovery notices (0=quiet default, 1=show).
+ * Failed capacity transactions and final allocation errors remain visible.
+ * Atomic presentation setting only; no CUDA calls, waits or policy changes.
+ * Returns 0 on success, 1 for values other than 0 or 1.
+ */
+DDO_VMM_API int ddo_vmm_set_recovery_warns_v1(int enabled);
 /** Optional process-lifetime release observations, no CUDA calls. Exactly six
  * uint64 values: sync calls, sync ns, failed proofs, cache eviction attempts,
  * attempted eviction bytes, eviction sync ns. Concurrent snapshots are approximate.

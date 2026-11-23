@@ -2,7 +2,11 @@
 
 ## Allocation recovery diagnostics
 
-The segmented pool writes allocation-pressure diagnostics to stderr. An initial
+The segmented pool keeps recovered allocation-pressure notices quiet by default.
+Enable `DDO_SHOW_RECOVERY_WARNS=1` before bootstrap to display them when using a
+binary with `ddo_vmm_set_recovery_warns_v1`. Older binaries report that the control
+is unavailable. Final allocation failures remain visible in either mode, and
+capacity receipts remain available independently of console visibility. An initial
 Driver or materialization refusal can be recovered by the capacity transaction.
 Its final summary distinguishes `status=recovered` (the allocation succeeded and
 execution can continue) from `status=failed` (the allocation was not satisfied).

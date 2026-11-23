@@ -124,6 +124,18 @@ class NativeVmmLibrary:
             "cache_eviction_sync_seconds": values[5] / 1e9,
         }
 
+    def set_recovery_warns(self, enabled: bool) -> bool:
+        """Set process-wide recovery notices; False means an older binary lacks control."""
+        if type(enabled) is not bool:
+            raise TypeError("show_recovery_warns must be a boolean")
+        fn = getattr(self._library, "ddo_vmm_set_recovery_warns_v1", None)
+        if fn is None:
+            return False
+        fn.argtypes, fn.restype = [ctypes.c_int], ctypes.c_int
+        if fn(int(enabled)) != 0:
+            raise NativeVmmError("native recovery notification configuration failed")
+        return True
+
     def set_allocation_diagnostics(self, enabled: bool) -> None:
         """Acquire/release a process-wide diagnostic scope; never initialize CUDA."""
         fn = getattr(self._library, "ddo_vmm_allocation_diagnostics_enable_v1", None)

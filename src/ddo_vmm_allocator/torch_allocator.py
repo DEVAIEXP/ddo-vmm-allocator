@@ -94,6 +94,7 @@ def install_pytorch_vmm_allocator(
     *,
     segmented_auto: bool | None = None,
     growable_reserve_bytes: int | None = None,
+    show_recovery_warns: bool | None = None,
 ) -> Any:
     """Install the DLL through PyTorch's official pluggable-allocator API.
 
@@ -121,6 +122,10 @@ def install_pytorch_vmm_allocator(
         )
     path = Path(resolved_path).expanduser().resolve(strict=True)
     auto, reserve = _resolve_pool_configuration(segmented_auto, growable_reserve_bytes)
+    if show_recovery_warns is None:
+        show_recovery_warns = bool(_environment_flag("DDO_SHOW_RECOVERY_WARNS"))
+    if type(show_recovery_warns) is not bool:
+        raise TorchAllocatorInstallError("show_recovery_warns must be a boolean")
 
     from ._library import load_library, require_exports
 
@@ -130,6 +135,14 @@ def install_pytorch_vmm_allocator(
                     TorchAllocatorInstallError)
     if auto:
         require_exports(library, path, _POOL_CONFIGURATION_EXPORTS, TorchAllocatorInstallError)
+
+    # Optional on older artifacts. Do not claim their console behavior changed.
+    notifications = getattr(library, "ddo_vmm_set_recovery_warns_v1", None)
+    if notifications is not None:
+        import ctypes
+        notifications.argtypes, notifications.restype = [ctypes.c_int], ctypes.c_int
+        if notifications(int(show_recovery_warns)) != 0:
+            raise TorchAllocatorInstallError("native recovery notification configuration failed")
 
     import torch
 

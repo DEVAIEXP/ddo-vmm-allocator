@@ -7,6 +7,7 @@
 #include "ddo_vmm_allocation_failure_trace.h"
 #include "ddo_vmm_allocation_attempt.h"
 #include "ddo_vmm_owner_observation.h"
+#include "ddo_vmm_recovery_warnings.h"
 #ifdef DDO_VMM_POOL_GEOMETRY_DIAGNOSTICS
 #include "ddo_vmm_pool_geometry.h"
 #endif
@@ -184,6 +185,7 @@ void publish_capacity_report(const CapacityReport& r) {
         std::scoped_lock lock(pool_mutex);
         last_capacity_report = r; capacity_report_recorded = true;
     }
+    if (!show_capacity_report(r.termination == term_satisfied)) return;
     auto v = [](uint64_t value) { return static_cast<unsigned long long>(value); };
     std::fprintf(stderr, "DDO segmented capacity transaction: request=%llu deficit=%llu owner_new=%llu operation=%llu"
         " status_first=%llu status_barrier=%llu status_continuation=%llu rollback_fresh=%llu rollback_released=%llu"
@@ -536,7 +538,7 @@ void* publish_segmented(const std::shared_ptr<Backing>& owner, size_t bytes, cud
     owner->retiring = true;
     if (!owner->segmented->materialize(*lease, owner->ledger, lock)) {
 #ifdef DDO_VMM_AUTO_SEGMENTED_CANDIDATE
-        std::fprintf(stderr, "DDO segmented materialization refusal: requested=%llu lease=%llu charged=%llu driver_status=%d recovery_used=%d recovery_error=%d\n",
+        if (show_recovery_warnings()) std::fprintf(stderr, "DDO segmented materialization refusal: requested=%llu lease=%llu charged=%llu driver_status=%d recovery_used=%d recovery_error=%d\n",
             static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(lease->size),
             static_cast<unsigned long long>(owner->segmented->physical_charge()),
             owner->segmented->error(), auto_recovery_used ? 1 : 0, auto_recovery_error);

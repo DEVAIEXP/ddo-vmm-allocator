@@ -1,5 +1,17 @@
 # Native contracts and ownership
 
+## Recovery notification control
+
+The optional `ddo_vmm_set_recovery_warns_v1(0|1)` export changes a process-wide,
+atomic console-notification flag without CUDA calls, waits or allocation changes.
+New builds default to quiet successful recovery. Opt-in enables transient
+materialization refusal details and successful capacity-transaction notices.
+Failed transaction reports and final allocation failures remain visible.
+Capacity receipts and counters are recorded regardless of console verbosity.
+Invalid flag values are refused without changing the previous value. Libraries
+without this export preserve their existing behavior; bindings report control
+as unavailable rather than claiming that old binaries were silenced.
+
 ## Optional execution-slot backing reclaim
 
 Execution pools expose additive `reclaim_idle`, `configure_reclaim` and

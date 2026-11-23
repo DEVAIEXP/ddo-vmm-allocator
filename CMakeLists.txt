@@ -64,6 +64,7 @@ add_library(ddo_vmm SHARED
     native/src/ddo_vmm_torch_allocator.cpp
     native/src/ddo_vmm_timeline.cpp
     native/src/ddo_vmm_mapping_trace.cpp
+    native/src/ddo_vmm_recovery_warnings.cpp
 )
 
 target_compile_features(ddo_vmm PRIVATE cxx_std_20)

@@ -38,8 +38,12 @@ void clean_rollback_owner(const std::shared_ptr<Backing>& owner) {
     check(!spans.reserved_count && !spans.leased && !spans.quarantined, "lease cancelled, nothing published");
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc > 1) {
+            check(argc == 2 && std::string(argv[1]) == "--show-recovery-warns", "known CPU presentation option");
+            recovery_warnings_enabled.store(true, std::memory_order_relaxed);
+        }
         // C2: OOM on create/map/access of unit k rolls back this call's fresh units.
         struct Case { const char* op; size_t nth; uint64_t operation; size_t unmaps, releases; };
         for (const Case c : {Case{"create", 3, 1, 2, 2}, Case{"map", 2, 2, 1, 2}, Case{"access", 1, 3, 1, 1}}) {

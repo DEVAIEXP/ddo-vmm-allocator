@@ -34,9 +34,9 @@ def install(monkeypatch, tmp_path):
     calls = []
 
     def run(library=None, **kwargs):
-        selected = library or Library(calls)
+        selected = library or Library(calls, missing=("ddo_vmm_set_recovery_warns_v1",))
         monkeypatch.setattr(_library.platform, "system", lambda: "Windows")
-        monkeypatch.setattr(_library.ctypes, "WinDLL", lambda value: selected)
+        monkeypatch.setattr(_library.ctypes, "WinDLL", lambda value: selected, raising=False)
         memory = SimpleNamespace(
             CUDAPluggableAllocator=lambda *args: calls.append(("pluggable", args)) or "allocator",
             change_current_allocator=lambda allocator: calls.append(("install", (allocator,))))
@@ -50,6 +50,7 @@ def install(monkeypatch, tmp_path):
 
     for name in (torch_allocator.SEGMENTED_AUTO_ENVIRONMENT, torch_allocator.GROWABLE_RESERVE_ENVIRONMENT):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("DDO_SHOW_RECOVERY_WARNS", raising=False)
     run.calls = calls
     return run
 
@@ -62,6 +63,20 @@ def test_default_leaves_pool_unconfigured(install):
     assert install() == "allocator"
     assert names(install.calls) == ["pluggable", "install"]
     assert torch_allocator.installed_pool_configuration() == {"segmented_auto": False, "growable_reserve_bytes": 0}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_recovery_notices_are_applied_before_allocator_install(install, enabled):
+    install(Library(install.calls), show_recovery_warns=enabled)
+    assert install.calls[0] == ("ddo_vmm_set_recovery_warns_v1", (int(enabled),))
+    assert names(install.calls)[-2:] == ["pluggable", "install"]
+
+
+def test_recovery_notification_configuration_failure_is_visible(install):
+    library = Library(install.calls, statuses={"ddo_vmm_set_recovery_warns_v1": 1})
+    with pytest.raises(torch_allocator.TorchAllocatorInstallError, match="notification configuration failed"):
+        install(library)
+    assert "install" not in names(install.calls)
 
 
 def test_explicit_configuration_runs_before_install_and_retains_library(install):
