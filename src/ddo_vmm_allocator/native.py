@@ -19,6 +19,42 @@ class NativeVmmError(RuntimeError):
     """Raised when a CUDA Driver VMM operation performed by the DLL fails."""
 
 
+class NativeVmmOutOfMemoryError(NativeVmmError):
+    """Model-weight GPU memory could not be obtained (native status OUT_OF_MEMORY).
+
+    Raised only for that status from execution-slot acquisition and arena range
+    faults. When PyTorch is importable the raised instance is also a
+    ``torch.OutOfMemoryError``; existing ``except NativeVmmError`` handlers and
+    fallbacks are unaffected.
+    """
+
+
+_DDO_VMM_OUT_OF_MEMORY = 2
+_torch_out_of_memory_type: type | None = None
+
+
+def _out_of_memory_type() -> type:
+    global _torch_out_of_memory_type
+    if _torch_out_of_memory_type is None:
+        try:
+            import torch
+
+            base = torch.OutOfMemoryError
+        except (ImportError, AttributeError):
+            return NativeVmmOutOfMemoryError
+        _torch_out_of_memory_type = type("NativeVmmOutOfMemoryError", (NativeVmmOutOfMemoryError, base),
+                                         {"__module__": __name__, "__doc__": NativeVmmOutOfMemoryError.__doc__})
+    return _torch_out_of_memory_type
+
+
+def _weight_memory_error(purpose: str, requested_bytes: int, detail: str) -> NativeVmmError:
+    mib = requested_bytes / 2**20
+    return _out_of_memory_type()(
+        f"DDO VMM allocator could not obtain {mib:.1f} MiB of GPU memory for model weights ({purpose}) after "
+        f"recovery. Other applications may be using GPU memory, or this workload does not fit the device. "
+        f"No weight storage was published. Native detail: {detail}")
+
+
 @dataclass(frozen=True)
 class NativeVmmRegionInfo:
     address: int
@@ -921,8 +957,11 @@ class NativeExecutionPool:
         if not self._handle.value:
             raise NativeVmmError("native execution pool is closed")
         slot, handle = ctypes.c_size_t(), ctypes.c_void_p()
-        self._check(self._owner._library.ddo_vmm_execution_pool_acquire(
-            self._handle, int(stream.cuda_stream), ctypes.byref(slot), ctypes.byref(handle)))
+        status = self._owner._library.ddo_vmm_execution_pool_acquire(
+            self._handle, int(stream.cuda_stream), ctypes.byref(slot), ctypes.byref(handle))
+        if status == _DDO_VMM_OUT_OF_MEMORY:
+            raise _weight_memory_error("execution slot", self.capacity_bytes, self._owner._last_error())
+        self._check(status)
         arena = self._arenas.get(slot.value)
         if arena is None:
             arena = NativeModelArena(self._owner, handle, backing=self._backing)
@@ -1038,9 +1077,12 @@ class NativeModelArena:
         if offset_bytes < 0 or size_bytes <= 0:
             raise ValueError("offset_bytes must be non-negative and size_bytes must be positive")
         signature = ctypes.c_uint64()
-        if self._owner._library.ddo_vmm_model_arena_fault_range(
+        status = self._owner._library.ddo_vmm_model_arena_fault_range(
             self._handle, offset_bytes, size_bytes, ctypes.byref(signature)
-        ) != 0:
+        )
+        if status == _DDO_VMM_OUT_OF_MEMORY:
+            raise _weight_memory_error("resident weight range", size_bytes, self._owner._last_error())
+        if status != 0:
             raise NativeVmmError(self._owner._last_error())
         return int(signature.value)
 
